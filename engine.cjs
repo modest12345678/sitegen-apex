@@ -1002,6 +1002,101 @@ function K_vmElemAt(S, arrKind, pos) {
   return pos;
 }
 
+const VM_NEXT_IP = new Int32Array(1);
+function K_vmColdOp(code, a1, a2, a3, ip, op, S) {
+  let sl = SLAB;
+  let slCap = sl.length;
+  if (code === OP_INT) {
+    let val = -1;
+    if (a1 === 0) val = S.pReadMin[S.regVal[a2]];
+    else if (a1 === 1) { const tc = S.tCount[S.regVal[a2]]; if (tc > 0) val = tc; }
+    else if (a1 === 2) val = S.tocLevel[S.regVal[a2]];
+    else if (a1 === 3) val = a3 === 0 ? S.pgNumber : S.pgTotal;
+    else if (a1 === 4) val = S.loopIdx[a2];
+    else val = S.loopLen[a2];
+    if (val >= 0) {
+      if (op + 16 > slCap) { sl = ensureSlab(op + 64, op); slCap = sl.length; }
+      if (val < 10) {
+        sl[op++] = 48 + val;
+      } else if (val < 100) {
+        const q = (val / 10) | 0;
+        sl[op++] = 48 + q;
+        sl[op++] = 48 + (val - q * 10);
+      } else {
+        op = writeOutUint(val, op);
+      }
+    }
+  } else if (code === OP_BOOL) {
+    let bv;
+    if (a1 === 0) bv = S.pIsPost[S.regVal[a2]] !== 0;
+    else if (a1 === 1) bv = S.loopIdx[a2] === 1;
+    else bv = S.loopIdx[a2] === S.loopLen[a2];
+    if (op + 8 > slCap) { sl = ensureSlab(op + 64, op); slCap = sl.length; }
+    if (bv) { sl[op++] = 116; sl[op++] = 114; sl[op++] = 117; sl[op++] = 101; }
+    else { sl[op++] = 102; sl[op++] = 97; sl[op++] = 108; sl[op++] = 115; sl[op++] = 101; }
+  } else if (code === OP_FOR_INIT) {
+    const d = a1 >>> 8;
+    const arrKind = a1 & 15;
+    const itemReg = a2 & 15;
+    const collReg = a2 >>> 8;
+    let st, en;
+    if (arrKind === 0) { st = S.curPostStart; en = st + S.curPostLen; }
+    else if (arrKind === 1) { const t = S.regVal[collReg]; st = S.tPostStart[t]; en = st + S.tPostCount[t]; }
+    else if (arrKind === 2) { const p = S.regVal[collReg]; st = S.pTagStart[p]; en = st + S.pTagCount[p]; }
+    else { const p = S.regVal[collReg]; st = S.pTocStart[p]; en = st + S.pTocCount[p]; }
+    const cnt = en - st;
+    if (cnt <= 0) {
+      ip = a3;
+    } else {
+      S.curArrPos[d] = st;
+      S.curArrEnd[d] = en;
+      S.curArrKind[d] = arrKind;
+      S.curItemReg[d] = itemReg;
+      S.loopIdx[d] = 1;
+      S.loopLen[d] = cnt;
+      S.regVal[itemReg] = K_vmElemAt(S, arrKind, st);
+    }
+  } else if (code === OP_FOR_CARDS_INIT) {
+    const d = a1 >>> 8;
+    const arrKind = a1 & 15;
+    const itemReg = a2 & 15;
+    const collReg = a2 >>> 8;
+    const st = arrKind === 0 ? S.curPostStart : S.tPostStart[S.regVal[collReg]];
+    const cnt = arrKind === 0 ? S.curPostLen : S.tPostCount[S.regVal[collReg]];
+    if (cnt <= 0) {
+      ip = a3;
+    } else {
+      S.curArrPos[d] = st;
+      S.curArrEnd[d] = st + cnt;
+      S.curArrKind[d] = arrKind;
+      S.curItemReg[d] = itemReg;
+      S.loopLen[d] = cnt;
+      S.loopIdx[d] = 1;
+    }
+  } else if (code === OP_FOR_CARDS_NEXT) {
+    const d = a1;
+    const cid = S.pendingCid;
+    if (cid !== -1) {
+      const cs = S.cardStartOp;
+      const cLen = op - cs;
+      const cp = S.cp;
+      if (cp + cLen <= S.cardLimit) {
+        sl.copyWithin(cp, cs, op);
+        S.cardOff[cid] = cp;
+        S.cardLen[cid] = cLen;
+        S.cp = cp + cLen;
+      }
+      S.pendingCid = -1;
+    }
+    const pos = S.curArrPos[d] + 1;
+    S.curArrPos[d] = pos;
+    S.loopIdx[d] += 1;
+    if (pos < S.curArrEnd[d]) ip = a2;
+  }
+  VM_NEXT_IP[0] = ip;
+  return op;
+}
+
 function KT_execVm(ops, nWords, op, S) {
   let ip = 0;
   op = op | 0;
@@ -1056,88 +1151,21 @@ function KT_execVm(ops, nWords, op, S) {
           op += sLen;
         }
       }
-    } else if (code === OP_INT) {
-      let val = -1;
-      if (a1 === 0) val = S.pReadMin[S.regVal[a2]];
-      else if (a1 === 1) { const tc = S.tCount[S.regVal[a2]]; if (tc > 0) val = tc; }
-      else if (a1 === 2) val = S.tocLevel[S.regVal[a2]];
-      else if (a1 === 3) val = a3 === 0 ? S.pgNumber : S.pgTotal;
-      else if (a1 === 4) val = S.loopIdx[a2];
-      else val = S.loopLen[a2];
-      if (val >= 0) {
-        if (op + 16 > slCap) { sl = ensureSlab(op + 64, op); slCap = sl.length; }
-        if (val < 10) {
-          sl[op++] = 48 + val;
-        } else if (val < 100) {
-          const q = (val / 10) | 0;
-          sl[op++] = 48 + q;
-          sl[op++] = 48 + (val - q * 10);
-        } else {
-          op = writeOutUint(val, op);
-          sl = SLAB; slCap = sl.length;
-        }
-      }
-    } else if (code === OP_BOOL) {
-      let bv;
-      if (a1 === 0) bv = S.pIsPost[S.regVal[a2]] !== 0;
-      else if (a1 === 1) bv = S.loopIdx[a2] === 1;
-      else bv = S.loopIdx[a2] === S.loopLen[a2];
-      if (op + 8 > slCap) { sl = ensureSlab(op + 64, op); slCap = sl.length; }
-      if (bv) { sl[op++] = 116; sl[op++] = 114; sl[op++] = 117; sl[op++] = 101; }
-      else { sl[op++] = 102; sl[op++] = 97; sl[op++] = 108; sl[op++] = 115; sl[op++] = 101; }
     } else if (code === OP_JMP) {
       ip = a1;
     } else if (code === OP_JCOND) {
       const inv = a2 & 1;
       const tru = a1 === 0 ? (S.pLen[S.regVal[a2 >>> 16] * PF_STRIDE + ((a2 >>> 8) & 255)] > 0 ? 1 : 0) : K_vmEvalCond(S, a1, a2);
       if ((tru ^ inv) === 0) ip = a3;
-    } else if (code === OP_FOR_INIT) {
-      const d = a1 >>> 8;
-      const arrKind = a1 & 15;
-      const itemReg = a2 & 15;
-      const collReg = a2 >>> 8;
-      let st, en;
-      if (arrKind === 0) { st = S.curPostStart; en = st + S.curPostLen; }
-      else if (arrKind === 1) { const t = S.regVal[collReg]; st = S.tPostStart[t]; en = st + S.tPostCount[t]; }
-      else if (arrKind === 2) { const p = S.regVal[collReg]; st = S.pTagStart[p]; en = st + S.pTagCount[p]; }
-      else { const p = S.regVal[collReg]; st = S.pTocStart[p]; en = st + S.pTocCount[p]; }
-      const cnt = en - st;
-      if (cnt <= 0) {
-        ip = a3;
-      } else {
-        S.curArrPos[d] = st;
-        S.curArrEnd[d] = en;
-        S.curArrKind[d] = arrKind;
-        S.curItemReg[d] = itemReg;
-        S.loopIdx[d] = 1;
-        S.loopLen[d] = cnt;
-        S.regVal[itemReg] = K_vmElemAt(S, arrKind, st);
-      }
     } else if (code === OP_FOR_NEXT) {
       const d = a1;
       const pos = S.curArrPos[d] + 1;
       if (pos < S.curArrEnd[d]) {
         S.curArrPos[d] = pos;
         S.loopIdx[d] += 1;
-        S.regVal[S.curItemReg[d]] = K_vmElemAt(S, S.curArrKind[d], pos);
+        const ak = S.curArrKind[d];
+        S.regVal[S.curItemReg[d]] = ak === 0 ? S.postPids[pos] : ak === 1 ? S.allTagPosts[pos] : ak === 2 ? S.allPageTags[pos] : pos;
         ip = a2;
-      }
-    } else if (code === OP_FOR_CARDS_INIT) {
-      const d = a1 >>> 8;
-      const arrKind = a1 & 15;
-      const itemReg = a2 & 15;
-      const collReg = a2 >>> 8;
-      const st = arrKind === 0 ? S.curPostStart : S.tPostStart[S.regVal[collReg]];
-      const cnt = arrKind === 0 ? S.curPostLen : S.tPostCount[S.regVal[collReg]];
-      if (cnt <= 0) {
-        ip = a3;
-      } else {
-        S.curArrPos[d] = st;
-        S.curArrEnd[d] = st + cnt;
-        S.curArrKind[d] = arrKind;
-        S.curItemReg[d] = itemReg;
-        S.loopLen[d] = cnt;
-        S.loopIdx[d] = 1;
       }
     } else if (code === OP_FOR_CARDS_CHECK) {
       const d = a1;
@@ -1171,25 +1199,10 @@ function KT_execVm(ops, nWords, op, S) {
         }
       }
       if (!fellThrough) ip = a2;
-    } else if (code === OP_FOR_CARDS_NEXT) {
-      const d = a1;
-      const cid = S.pendingCid;
-      if (cid !== -1) {
-        const cs = S.cardStartOp;
-        const cLen = op - cs;
-        const cp = S.cp;
-        if (cp + cLen <= S.cardLimit) {
-          sl.copyWithin(cp, cs, op);
-          S.cardOff[cid] = cp;
-          S.cardLen[cid] = cLen;
-          S.cp = cp + cLen;
-        }
-        S.pendingCid = -1;
-      }
-      const pos = S.curArrPos[d] + 1;
-      S.curArrPos[d] = pos;
-      S.loopIdx[d] += 1;
-      if (pos < S.curArrEnd[d]) ip = a2;
+    } else {
+      op = K_vmColdOp(code, a1, a2, a3, ip, op, S);
+      ip = VM_NEXT_IP[0];
+      sl = SLAB; slCap = sl.length;
     }
   }
   return op;
@@ -1743,7 +1756,7 @@ function K_mdBlock(bodyLat, bodyBase, pos, nl, len, bodyS, p, linkCtx, tocOut) {
   return -1;
 }
 
-function KT_renderMd(bodyLat, bodyBase, bodyS, bodyE, hpStart, linkCtx, tocOut, blkTbl, mayEndTbl) {
+function K_renderMd(bodyLat, bodyBase, bodyS, bodyE, hpStart, linkCtx, tocOut, blkTbl, mayEndTbl) {
   REUSABLE_HIDS.clear();
   let p = hpStart | 0;
   const len = bodyE | 0;
@@ -2780,7 +2793,7 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
     const bS = it.bodyStart;
     const bE = it.bodyEnd;
     S.pTocStart[pid] = tocOut.count;
-    KT_renderMd(bodyLat, bodyBase, bS, bE, hpBox.hp, linkCtx, tocOut, BLK_START, MAY_END_PARA);
+    K_renderMd(bodyLat, bodyBase, bS, bE, hpBox.hp, linkCtx, tocOut, BLK_START, MAY_END_PARA);
     hpBox.hp = mdr.hp;
     S.pTocCount[pid] = tocOut.count - S.pTocStart[pid];
 
@@ -3078,20 +3091,23 @@ function seedFeedback() {
   FEEDBACK_SEEDED = true;
   const sample = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa **a *b* c** *d **e** f* *x `c` `y \\* \\> \\\\ & [t](https://a) [u';
   const n = SLAB_BUF.utf8Write(sample, 0);
-  const dummyCtx = { dir: '', upPrefix: [''], dirParts: [], bySource: new Map(), staticSet: new Set(), broken: new Set(), base: '', srcPath: '', uCache: null };
-  KT_mdInline(SLAB, 0, n, 256, dummyCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
   const np = PARA_BUF_B.utf8Write(sample, 0);
-  KT_mdInline(PARA_BUF, 0, np, 512, dummyCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
-
+  const dummyCtx = { dir: '', upPrefix: [''], dirParts: [], bySource: new Map(), staticSet: new Set(), broken: new Set(), base: '', srcPath: '', uCache: null };
   const dummyHp = { hp: 512 };
-  KT_writeFieldH('abc', VM_S.pOff, VM_S.pLen, 0, dummyHp, HJ_LEN);
-  KT_writeFieldH('a&é', VM_S.pOff, VM_S.pLen, 1, dummyHp, HJ_LEN);
 
   SLAB_BUF.latin1Write('01234567890123456789012345678901234567890123456', 1024);
   VM_S.pOff[0] = 1024; VM_S.pLen[0] = 45;
   VM_S.pOff[PF_STRIDE] = 1024; VM_S.pLen[PF_STRIDE] = 5;
+  VM_S.tOff[0] = 1024; VM_S.tLen[0] = 5;
+  VM_S.tocIdOff[0] = 1024; VM_S.tocIdLen[0] = 5;
+  VM_S.tocHtmlOff[0] = 1024; VM_S.tocHtmlLen[0] = 5;
+  VM_S.pgOff[0] = 1024; VM_S.pgLen[0] = 5;
   VM_S.pNewer[0] = 0; VM_S.pOlder[0] = -1; VM_S.pIsPost[0] = 1; VM_S.pReadMin[0] = 2;
   VM_S.postPids[0] = 0; VM_S.postPids[1] = 0; VM_S.pCid[0] = 0; VM_S.cardLen[0] = -1;
+  VM_S.allTagPosts[0] = 0; VM_S.allTagPosts[1] = 0; VM_S.allPageTags[0] = 0;
+  VM_S.tPostStart[0] = 0; VM_S.tPostCount[0] = 2;
+  VM_S.pTagStart[0] = 0; VM_S.pTagCount[0] = 2;
+  VM_S.pTocStart[0] = 0; VM_S.pTocCount[0] = 2;
   VM_S.curPostStart = 0; VM_S.curPostLen = 2; VM_S.cp = 2048; VM_S.cardLimit = 4096; VM_S.regVal[0] = 0;
   const seedOps = Int32Array.from([
     OP_LIT, 1024, 5, 0,
@@ -3099,27 +3115,49 @@ function seedFeedback() {
     OP_STR, 0, 0, 0,
     OP_STR, 1, 0, 0,
     OP_STR, 2, 0, 0,
+    OP_STR, 3, 0, 0,
+    OP_STR, 4, 0, 0,
+    OP_STR, 4, 0, 1,
+    OP_STR, 5, 0, 0,
     OP_INT, 0, 0, 0,
     OP_BOOL, 0, 0, 0,
-    OP_JCOND, 0, 0, 32,
-    OP_JCOND, 1, (16 << 8) | 15, 36,
-    OP_JMP, 40, 0, 0,
-    OP_FOR_CARDS_INIT, 0, 1, 60,
-    OP_FOR_CARDS_CHECK, 0, 60, 0,
+    OP_JCOND, 0, 0, 56,
+    OP_JCOND, 1, (16 << 8) | 15, 56,
+    OP_JMP, 56, 0, 0,
+    OP_FOR_INIT, 2, 1, 68,
+    OP_LIT, 1024, 5, 0,
+    OP_FOR_NEXT, 0, 60, 0,
+    OP_FOR_INIT, 3, 1, 80,
+    OP_LIT, 1024, 5, 0,
+    OP_FOR_NEXT, 0, 72, 0,
+    OP_FOR_CARDS_INIT, 0, 1, 100,
+    OP_FOR_CARDS_CHECK, 0, 100, 0,
     OP_LIT, 1024, 5, 0,
     OP_STR, 0, 1, 0,
-    OP_FOR_CARDS_NEXT, 0, 44, 0,
+    OP_FOR_CARDS_NEXT, 0, 84, 0,
+    OP_FOR_CARDS_INIT, 1, 1, 120,
+    OP_FOR_CARDS_CHECK, 0, 120, 0,
+    OP_LIT, 1024, 5, 0,
+    OP_STR, 0, 1, 0,
+    OP_FOR_CARDS_NEXT, 0, 104, 0,
   ]);
-  KT_execVm(seedOps, seedOps.length, 4096, VM_S);
+  for (let w = 0; w < 12; w++) {
+    dummyHp.hp = 512;
+    KT_mdInline(SLAB, 0, n, 256, dummyCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
+    KT_mdInline(PARA_BUF, 0, np, 512, dummyCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
+    KT_writeFieldH('abc', VM_S.pOff, VM_S.pLen, 0, dummyHp, HJ_LEN);
+    KT_writeFieldH('a&é', VM_S.pOff, VM_S.pLen, 1, dummyHp, HJ_LEN);
+    VM_S.pOff[0] = 1024; VM_S.pLen[0] = 45;
+    VM_S.pOff[PF_STRIDE] = 1024; VM_S.pLen[PF_STRIDE] = 5;
+    VM_S.cardLen[0] = (w & 1) === 0 ? -1 : 45;
+    VM_S.cardOff[0] = 1024;
+    KT_execVm(seedOps, seedOps.length, 4096, VM_S);
+  }
   VM_S.cardLen[0] = -1; VM_S.pNewer[0] = -1; VM_S.pOlder[0] = -1;
   VM_S.pendingCid = -1; VM_S.cp = 0; VM_S.cardLimit = 0;
   VM_S.pReadMin[0] = 0; VM_S.pIsPost[0] = 0; VM_S.curPostLen = 0;
-
-  const fmSample = '---\ntitle: "a\\"b"\ndate: 2024-01-01\ntags: [a, b]\ndraft: false\nlayout: post\nslug: a\nsummary: s\n---\n';
-  const fmN = FM_BUF_B.utf8Write(fmSample, 0);
-  K_parseFm(FM_BUF, FM_BUF_B, 0, fmN);
-  FM_RES.title = ''; FM_RES.date = ''; FM_RES.summary = ''; FM_RES.layout = '';
-  FM_RES.slug = ''; FM_RES.draft = false; FM_RES.tags = null; FM_RES.err = ''; FM_RES.bodyStart = 0;
+  VM_S.tPostCount[0] = 0; VM_S.pTagCount[0] = 0; VM_S.pTocCount[0] = 0;
+  VM_S.tLen[0] = 0; VM_S.tocIdLen[0] = 0; VM_S.tocHtmlLen[0] = 0; VM_S.pgLen[0] = 0;
 }
 
 const OUT_RANGE = { start: 0, end: 0 };
