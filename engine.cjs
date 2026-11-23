@@ -1,60 +1,59 @@
-// sitegen-apex v8: Unified CopyWithin Slab + Frontmatter-First Skip + Branchless 4x WordCount + Flat Bytecode VM
+// sitegen-apex v10: Zero-ESM CJS + Zero-Fault Slab + Zero-Exit KT_mdInline + Surgical 0-Deopt TF Kernels
 'use strict';
 
 const { openSync, closeSync, fstatSync, readSync, writeSync } = require('node:fs');
 
 // ---------------------------------------------------------------------------
-// Unified Pre-Allocated CopyWithin Slab (SLAB + SLAB_BUF share ArrayBuffer)
+// Unified Zero-Fault Slab (Buffer.allocUnsafeSlow -> monomorphic Uint8Array, zero memset)
 // Layout in runFile(): [0..rawLen) raw cases.json | [rawLen..bodyEnd) bodies |
 // [bodyEnd..pagerBase) HTML/templates | [pagerBase..cardBase) pager scratch |
 // [cardBase..outBase) cached post cards | [outBase..) JSON output stream
 // ---------------------------------------------------------------------------
-let SLAB = new Uint8Array(12 * 1024 * 1024);
-let SLAB_BUF = Buffer.from(SLAB.buffer);
+function allocU8(size) {
+  const b = Buffer.allocUnsafeSlow(size);
+  return [new Uint8Array(b.buffer, b.byteOffset, b.byteLength), b];
+}
+
+let [SLAB, SLAB_BUF] = allocU8(10 * 1024 * 1024);
 
 function ensureSlab(need, used) {
   if (need <= SLAB.length) return SLAB;
   let cap = SLAB.length;
   while (cap < need) cap *= 2;
-  const next = new Uint8Array(cap);
+  const [next, nextB] = allocU8(cap);
   if (used > 0) next.set(SLAB.subarray(0, used));
   SLAB = next;
-  SLAB_BUF = Buffer.from(next.buffer);
+  SLAB_BUF = nextB;
   return SLAB;
 }
 
-let PARA_BUF = new Uint8Array(64 * 1024);
-let PARA_BUF_B = Buffer.from(PARA_BUF.buffer);
+let [PARA_BUF, PARA_BUF_B] = allocU8(64 * 1024);
 function ensureParaBuf(need, curLen) {
   if (need <= PARA_BUF.length) return PARA_BUF;
   let cap = PARA_BUF.length;
   while (cap < need) cap *= 2;
-  const next = new Uint8Array(cap);
+  const [next, nextB] = allocU8(cap);
   if (curLen > 0) next.set(PARA_BUF.subarray(0, curLen));
   PARA_BUF = next;
-  PARA_BUF_B = Buffer.from(next.buffer);
+  PARA_BUF_B = nextB;
   return PARA_BUF;
 }
 
-let FM_BUF = new Uint8Array(8 * 1024);
-let FM_BUF_B = Buffer.from(FM_BUF.buffer);
+let [FM_BUF, FM_BUF_B] = allocU8(8 * 1024);
 function ensureFmBuf(need) {
   if (need <= FM_BUF.length) return FM_BUF;
   let cap = FM_BUF.length;
   while (cap < need) cap *= 2;
-  FM_BUF = new Uint8Array(cap);
-  FM_BUF_B = Buffer.from(FM_BUF.buffer);
+  [FM_BUF, FM_BUF_B] = allocU8(cap);
   return FM_BUF;
 }
 
-let LINK_BUF = new Uint8Array(8 * 1024);
-let LINK_BUF_B = Buffer.from(LINK_BUF.buffer);
+let [LINK_BUF, LINK_BUF_B] = allocU8(8 * 1024);
 function ensureLinkBuf(need) {
   if (need <= LINK_BUF.length) return LINK_BUF;
   let cap = LINK_BUF.length;
   while (cap < need) cap *= 2;
-  LINK_BUF = new Uint8Array(cap);
-  LINK_BUF_B = Buffer.from(LINK_BUF.buffer);
+  [LINK_BUF, LINK_BUF_B] = allocU8(cap);
   return LINK_BUF;
 }
 
@@ -175,7 +174,7 @@ function isUnicodeWsCp(cp) {
 }
 
 // Returns +nextIdx if multi-byte UTF-8 at i is Unicode WS, or -nextIdx if non-WS (Smi only, zero alloc).
-function nonAsciiWsStep(buf, i, end) {
+function K_nonAsciiWs(buf, i, end) {
   const b0 = buf[i];
   if (b0 < 0xE0) {
     if (b0 >= 0xC2 && i + 1 < end) {
@@ -205,7 +204,7 @@ function nonAsciiWsStep(buf, i, end) {
   return -(i + 1);
 }
 
-function slugifyStr(text, uCache = null) {
+function K_slugifyStr(text, uCache = null) {
   const n = text.length;
   for (let i = 0; i < n; i++) {
     if (text.charCodeAt(i) >= 128) return slugifyUnicode(text, uCache);
@@ -231,7 +230,7 @@ function slugifyStr(text, uCache = null) {
   return outLen === 0 ? 'untitled' : SLUG_SCRATCH.toString('latin1', 0, outLen);
 }
 
-function slugifyBuf(buf, s, e, uCache = null) {
+function K_slugifyBuf(buf, s, e, uCache = null) {
   for (let i = s; i < e; i++) {
     if (buf[i] >= 128) {
       const b = buf === SLAB ? SLAB_BUF : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -348,7 +347,7 @@ function truthy(v) {
 
 // Unescape JSON string [s..e) into slab[dp..], normalizing \r\n and \r -> \n.
 // Uses latin1 indexOf('\\') + copyWithin; returns -1 on \uXXXX or unknown escape.
-function K_unescIdxOfCW(slab, lat, s, e, dp, tbl) {
+function KT_unescIdxOfCW(slab, lat, s, e, dp, tbl) {
   let i = s | 0;
   let p = dp | 0;
   const end = e | 0;
@@ -383,7 +382,7 @@ function K_unescIdxOfCW(slab, lat, s, e, dp, tbl) {
 }
 
 // Small separate-buffer unescape for frontmatter [s..e) into FM_BUF[0..].
-function unescSmall(src, s, e, dst, tbl) {
+function K_unescSmall(src, s, e, dst, tbl) {
   let i = s | 0;
   let p = 0;
   const end = e | 0;
@@ -414,7 +413,7 @@ function unescSmall(src, s, e, dst, tbl) {
 let FM_RAW_BODY_S = 0;
 // Locate closing '---' of frontmatter directly in JSON-escaped raw SLAB (only when !hasAnyU).
 // Returns fmRawEnd (>= 0) and sets FM_RAW_BODY_S, or -2 (no front matter), or -3 (not closed).
-function findRawFmEnd(slab, lat, rawS, rawE) {
+function K_findRawFmEnd(slab, lat, rawS, rawE) {
   const rLen = rawE - rawS;
   if (rLen < 3 || slab[rawS] !== 45 || slab[rawS + 1] !== 45 || slab[rawS + 2] !== 45) return -2;
   let scan;
@@ -461,7 +460,7 @@ function findRawFmEnd(slab, lat, rawS, rawE) {
 }
 
 // SIMD-assisted JSON string end finder on latin1 view.
-function findStrEnd(lat, s) {
+function KT_findStrEnd(lat, s) {
   let q = lat.indexOf('"', s);
   while (q !== -1) {
     let bs = q - 1;
@@ -473,7 +472,7 @@ function findStrEnd(lat, s) {
 }
 
 // Branchless 4x-unrolled UTF-8 word counter matching JS String(/\S+/g) exact rules.
-function K_words4(buf, s, e, cls) {
+function KT_words4(buf, s, e, cls) {
   let words = 0;
   let prev = 0;
   let i = s | 0;
@@ -497,7 +496,7 @@ function K_words4(buf, s, e, cls) {
       prev = t;
       i++;
     } else {
-      const r = nonAsciiWsStep(buf, i, end);
+      const r = K_nonAsciiWs(buf, i, end);
       if (r > 0) {
         prev = 0;
         i = r;
@@ -513,7 +512,7 @@ function K_words4(buf, s, e, cls) {
 
 // Fast scanner + HTML/JSON escaper using copyWithin inside unified SLAB (stops on lut[b]===1).
 const SCAN_P = new Int32Array(1);
-function K_scanEsc(src, s, e, dst, p, lut, flat) {
+function KT_scanEsc(src, s, e, dst, p, lut, flat) {
   let i = s | 0;
   const end = e | 0;
   let op = p | 0;
@@ -545,8 +544,8 @@ function K_scanEsc(src, s, e, dst, p, lut, flat) {
   return i;
 }
 
-// Byte helpers for mdInline & renderMarkdownIntoHBuf
-function findUnescapedCharBuf(src, target, from, end) {
+// Cold helpers + zero-exit TurboFan KT_mdInline kernel
+function K_findChar(src, target, from, end) {
   const esc = ESCAPABLE_CC;
   for (let j = from; j < end; j++) {
     const c = src[j];
@@ -556,30 +555,7 @@ function findUnescapedCharBuf(src, target, from, end) {
   return -1;
 }
 
-function findUnescapedDStarBuf(src, from, end) {
-  const esc = ESCAPABLE_CC;
-  const lim = end - 1;
-  for (let j = from; j < lim; j++) {
-    const c = src[j];
-    if (c === 92 && j + 1 < end && esc[src[j + 1]] === 1) { j++; continue; }
-    if (c === 42 && src[j + 1] === 42) return j;
-  }
-  return -1;
-}
-
-function findSingleStarBuf(src, from, end) {
-  const esc = ESCAPABLE_CC;
-  for (let j = from; j < end; j++) {
-    const c = src[j];
-    if (c === 92 && j + 1 < end && esc[src[j + 1]] === 1) { j++; continue; }
-    if (c !== 42) continue;
-    if (j + 1 < end && src[j + 1] === 42) { j++; continue; }
-    return j;
-  }
-  return -1;
-}
-
-function hasBufWhitespace(src, a, b) {
+function K_hasWs(src, a, b) {
   const ws = WS_TBL;
   let i = a;
   while (i < b) {
@@ -588,7 +564,7 @@ function hasBufWhitespace(src, a, b) {
       if (ws[c] === 1) return true;
       i++;
     } else {
-      const r = nonAsciiWsStep(src, i, b);
+      const r = K_nonAsciiWs(src, i, b);
       if (r > 0) return true;
       i = -r;
     }
@@ -596,7 +572,7 @@ function hasBufWhitespace(src, a, b) {
   return false;
 }
 
-function isSchemeBuf(src, a, b) {
+function K_isScheme(src, a, b) {
   if (a >= b || SCHEME_F[src[a]] === 0) return false;
   for (let i = a + 1; i < b; i++) {
     const c = src[i];
@@ -606,13 +582,13 @@ function isSchemeBuf(src, a, b) {
   return false;
 }
 
-function writeResolvedHref(src, hs, he, remEnd, p, ctx) {
+function K_writeHref(src, hs, he, remEnd, p, ctx) {
   const srcIsSlab = src === SLAB;
   const c0 = src[hs];
-  if (c0 === 47 || c0 === 35 || isSchemeBuf(src, hs, he)) {
+  if (c0 === 47 || c0 === 35 || K_isScheme(src, hs, he)) {
     const need = p + (he - hs) * 6 + remEnd * 6 + 65536;
     if (need > SLAB.length) ensureSlab(need, p);
-    K_scanEsc(srcIsSlab ? SLAB : src, hs, he, SLAB, p, HJ_LEN, HJ_FLAT);
+    KT_scanEsc(srcIsSlab ? SLAB : src, hs, he, SLAB, p, HJ_LEN, HJ_FLAT);
     return SCAN_P[0];
   }
   const srcB = srcIsSlab ? SLAB_BUF : (src === PARA_BUF ? PARA_BUF_B : Buffer.from(src.buffer, src.byteOffset, src.byteLength));
@@ -655,7 +631,7 @@ function writeResolvedHref(src, hs, he, remEnd, p, ctx) {
         let hb = hs;
         const curSrc = srcIsSlab ? sl : src;
         while (hb < he && curSrc[hb] !== 35) hb++;
-        K_scanEsc(curSrc, hb, he, sl, p, HJ_LEN, HJ_FLAT);
+        KT_scanEsc(curSrc, hb, he, sl, p, HJ_LEN, HJ_FLAT);
         p = SCAN_P[0];
       }
       return p;
@@ -673,29 +649,80 @@ function writeResolvedHref(src, hs, he, remEnd, p, ctx) {
   const nb = LINK_BUF_B.utf8Write(resolved, 0);
   const need = p + nb * 6 + remEnd * 6 + 65536;
   if (need > SLAB.length) ensureSlab(need, p);
-  K_scanEsc(lb, 0, nb, SLAB, p, HJ_LEN, HJ_FLAT);
+  KT_scanEsc(lb, 0, nb, SLAB, p, HJ_LEN, HJ_FLAT);
   return SCAN_P[0];
 }
 
-// Slim freq-ordered inline Markdown renderer using K_scanEsc (*, `, [, \).
-function mdInline(src, s, e, p, ctx) {
+const LINK_NEXT_I = new Int32Array(1);
+function K_mdLink(curSrc, srcIsSlab, i, end, p, ctx) {
+  const k = K_findChar(curSrc, 93, i + 1, end);
+  if (k !== -1 && k + 1 < end && curSrc[k + 1] === 40) {
+    let m = k + 2;
+    while (m < end && curSrc[m] !== 41) m++;
+    if (m < end && m > k + 2 && !K_hasWs(curSrc, k + 2, m)) {
+      let dst = SLAB;
+      dst[p++] = 60; dst[p++] = 97; dst[p++] = 32; dst[p++] = 104; dst[p++] = 114; dst[p++] = 101; dst[p++] = 102; dst[p++] = 61; dst[p++] = 92; dst[p++] = 34; // <a href=\"
+      p = K_writeHref(curSrc, k + 2, m, end - m, p, ctx);
+      dst = SLAB;
+      if (p + (k - i) * 10 + 65536 > dst.length) dst = ensureSlab(p + (k - i) * 10 + 65536, p);
+      dst[p++] = 92; dst[p++] = 34; dst[p++] = 62; // \">
+      p = KT_mdInline(srcIsSlab ? dst : curSrc, i + 1, k, p, ctx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
+      dst = SLAB;
+      dst[p++] = 60; dst[p++] = 47; dst[p++] = 97; dst[p++] = 62; // </a>
+      LINK_NEXT_I[0] = m + 1;
+      return p;
+    }
+  }
+  const dst = SLAB;
+  dst[p++] = 91;
+  LINK_NEXT_I[0] = i + 1;
+  return p;
+}
+
+// Zero-exit inline Markdown + HTML/JSON escaping kernel (monomorphic Uint8Array src, Smi indices).
+function KT_mdInline(src, s, e, p, ctx, lut, flat, esc) {
   let i = s | 0;
   const end = e | 0;
+  p = p | 0;
   const srcIsSlab = src === SLAB;
+  let dst = SLAB;
   while (i < end) {
-    let curSrc = srcIsSlab ? SLAB : src;
-    i = K_scanEsc(curSrc, i, end, SLAB, p, MD_LUT, HJ_FLAT);
-    p = SCAN_P[0];
+    const curSrc = srcIsSlab ? dst : src;
+    const st = i;
+    while (i < end && lut[curSrc[i]] === 0) i++;
+    const n = i - st;
+    if (n > 0) {
+      if (n <= 40) {
+        for (let k = st; k < i; k++) dst[p++] = curSrc[k];
+      } else if (srcIsSlab) {
+        dst.copyWithin(p, st, i);
+        p += n;
+      } else {
+        dst.set(curSrc.subarray(st, i), p);
+        p += n;
+      }
+    }
     if (i >= end) break;
-    let dst = SLAB;
-    curSrc = srcIsSlab ? dst : src;
     const ch = curSrc[i];
+    const code = lut[ch];
+    if (code !== 1) {
+      const off = ch << 3;
+      for (let k = 0; k < code; k++) dst[p++] = flat[off + k];
+      i++;
+      continue;
+    }
     if (ch === 42) {
       if (i + 1 < end && curSrc[i + 1] === 42) {
-        const j = findUnescapedDStarBuf(curSrc, i + 2, end);
+        let j = -1;
+        const lim = end - 1;
+        for (let t = i + 2; t < lim; t++) {
+          const tc = curSrc[t];
+          if (tc === 92 && t + 1 < end && esc[curSrc[t + 1]] === 1) { t++; continue; }
+          if (tc === 42 && curSrc[t + 1] === 42) { j = t; break; }
+        }
         if (j > i + 2) {
           dst[p++] = 60; dst[p++] = 115; dst[p++] = 116; dst[p++] = 114; dst[p++] = 111; dst[p++] = 110; dst[p++] = 103; dst[p++] = 62; // <strong>
-          p = mdInline(curSrc, i + 2, j, p, ctx);
+          p = KT_mdInline(curSrc, i + 2, j, p, ctx, lut, flat, esc);
           dst = SLAB;
           dst[p++] = 60; dst[p++] = 47; dst[p++] = 115; dst[p++] = 116; dst[p++] = 114; dst[p++] = 111; dst[p++] = 110; dst[p++] = 103; dst[p++] = 62; // </strong>
           i = j + 2;
@@ -704,10 +731,18 @@ function mdInline(src, s, e, p, ctx) {
           i += 2;
         }
       } else {
-        const j = findSingleStarBuf(curSrc, i + 1, end);
+        let j = -1;
+        for (let t = i + 1; t < end; t++) {
+          const tc = curSrc[t];
+          if (tc === 92 && t + 1 < end && esc[curSrc[t + 1]] === 1) { t++; continue; }
+          if (tc !== 42) continue;
+          if (t + 1 < end && curSrc[t + 1] === 42) { t++; continue; }
+          j = t;
+          break;
+        }
         if (j > i + 1) {
           dst[p++] = 60; dst[p++] = 101; dst[p++] = 109; dst[p++] = 62; // <em>
-          p = mdInline(curSrc, i + 1, j, p, ctx);
+          p = KT_mdInline(curSrc, i + 1, j, p, ctx, lut, flat, esc);
           dst = SLAB;
           dst[p++] = 60; dst[p++] = 47; dst[p++] = 101; dst[p++] = 109; dst[p++] = 62; // </em>
           i = j + 1;
@@ -723,7 +758,7 @@ function mdInline(src, s, e, p, ctx) {
       while (j < end && curSrc[j] !== 96) j++;
       if (j < end && j > i + 1) {
         dst[p++] = 60; dst[p++] = 99; dst[p++] = 111; dst[p++] = 100; dst[p++] = 101; dst[p++] = 62; // <code>
-        K_scanEsc(curSrc, i + 1, j, dst, p, HJ_LEN, HJ_FLAT);
+        KT_scanEsc(curSrc, i + 1, j, dst, p, HJ_LEN, flat);
         p = SCAN_P[0];
         dst[p++] = 60; dst[p++] = 47; dst[p++] = 99; dst[p++] = 111; dst[p++] = 100; dst[p++] = 101; dst[p++] = 62; // </code>
         i = j + 1;
@@ -734,30 +769,15 @@ function mdInline(src, s, e, p, ctx) {
       continue;
     }
     if (ch === 91) {
-      const k = findUnescapedCharBuf(curSrc, 93, i + 1, end);
-      if (k !== -1 && k + 1 < end && curSrc[k + 1] === 40) {
-        let m = k + 2;
-        while (m < end && curSrc[m] !== 41) m++;
-        if (m < end && m > k + 2 && !hasBufWhitespace(curSrc, k + 2, m)) {
-          dst[p++] = 60; dst[p++] = 97; dst[p++] = 32; dst[p++] = 104; dst[p++] = 114; dst[p++] = 101; dst[p++] = 102; dst[p++] = 61; dst[p++] = 92; dst[p++] = 34; // <a href=\"
-          p = writeResolvedHref(curSrc, k + 2, m, end - m, p, ctx);
-          dst = SLAB;
-          dst[p++] = 92; dst[p++] = 34; dst[p++] = 62; // \">
-          p = mdInline(srcIsSlab ? dst : curSrc, i + 1, k, p, ctx);
-          dst = SLAB;
-          dst[p++] = 60; dst[p++] = 47; dst[p++] = 97; dst[p++] = 62; // </a>
-          i = m + 1;
-          continue;
-        }
-      }
-      dst[p++] = 91;
-      i++;
+      p = K_mdLink(curSrc, srcIsSlab, i, end, p, ctx);
+      dst = SLAB;
+      i = LINK_NEXT_I[0];
       continue;
     }
     // ch === 92 '\\'
     if (i + 1 < end) {
       const nc = curSrc[i + 1];
-      if (ESCAPABLE_CC[nc] === 1) {
+      if (esc[nc] === 1) {
         if (nc === 62) {
           dst[p++] = 38; dst[p++] = 103; dst[p++] = 116; dst[p++] = 59; // &gt;
         } else if (nc === 92) {
@@ -934,7 +954,7 @@ const OP_FOR_CARDS_INIT = 9;
 const OP_FOR_CARDS_CHECK = 10;
 const OP_FOR_CARDS_NEXT = 11;
 
-function vmEvalCond(S, condKind, a2) {
+function K_vmEvalCond(S, condKind, a2) {
   const reg = a2 >>> 16;
   const slot = (a2 >>> 8) & 255;
   const val = S.regVal[reg];
@@ -975,18 +995,20 @@ function vmEvalCond(S, condKind, a2) {
   return S.curPostLen > 0 ? 1 : 0;
 }
 
-function vmElemAt(S, arrKind, pos) {
+function K_vmElemAt(S, arrKind, pos) {
   if (arrKind === 0) return S.postPids[pos];
   if (arrKind === 1) return S.allTagPosts[pos];
   if (arrKind === 2) return S.allPageTags[pos];
   return pos;
 }
 
-function execVm(ops, nWords, op, S) {
+function KT_execVm(ops, nWords, op, S) {
   let ip = 0;
+  op = op | 0;
+  const endW = nWords | 0;
   let sl = SLAB;
   let slCap = sl.length;
-  while (ip < nWords) {
+  while (ip < endW) {
     const code = ops[ip];
     const a1 = ops[ip + 1];
     const a2 = ops[ip + 2];
@@ -1067,7 +1089,7 @@ function execVm(ops, nWords, op, S) {
       ip = a1;
     } else if (code === OP_JCOND) {
       const inv = a2 & 1;
-      const tru = vmEvalCond(S, a1, a2);
+      const tru = a1 === 0 ? (S.pLen[S.regVal[a2 >>> 16] * PF_STRIDE + ((a2 >>> 8) & 255)] > 0 ? 1 : 0) : K_vmEvalCond(S, a1, a2);
       if ((tru ^ inv) === 0) ip = a3;
     } else if (code === OP_FOR_INIT) {
       const d = a1 >>> 8;
@@ -1089,7 +1111,7 @@ function execVm(ops, nWords, op, S) {
         S.curItemReg[d] = itemReg;
         S.loopIdx[d] = 1;
         S.loopLen[d] = cnt;
-        S.regVal[itemReg] = vmElemAt(S, arrKind, st);
+        S.regVal[itemReg] = K_vmElemAt(S, arrKind, st);
       }
     } else if (code === OP_FOR_NEXT) {
       const d = a1;
@@ -1097,7 +1119,7 @@ function execVm(ops, nWords, op, S) {
       if (pos < S.curArrEnd[d]) {
         S.curArrPos[d] = pos;
         S.loopIdx[d] += 1;
-        S.regVal[S.curItemReg[d]] = vmElemAt(S, S.curArrKind[d], pos);
+        S.regVal[S.curItemReg[d]] = K_vmElemAt(S, S.curArrKind[d], pos);
         ip = a2;
       }
     } else if (code === OP_FOR_CARDS_INIT) {
@@ -1177,7 +1199,7 @@ function execVm(ops, nWords, op, S) {
 // Byte-Native Frontmatter Parser
 // ---------------------------------------------------------------------------
 const DAYS_NORM = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-function isValidDateBuf(buf, s, e) {
+function K_isValidDate(buf, s, e) {
   if (e - s !== 10 || buf[s + 4] !== 45 || buf[s + 7] !== 45) return false;
   for (let i = 0; i < 10; i++) {
     if (i === 4 || i === 7) continue;
@@ -1194,7 +1216,7 @@ function isValidDateBuf(buf, s, e) {
 }
 
 let FM_ERR_Q = '';
-function parseQuotedFmBuf(buf, bufB, s, e) {
+function K_parseQuotedFm(buf, bufB, s, e) {
   if (e - s < 2 || buf[e - 1] !== 34) { FM_ERR_Q = 'a quoted string is not closed'; return null; }
   const innerS = s + 1;
   const innerE = e - 1;
@@ -1223,7 +1245,7 @@ function parseQuotedFmBuf(buf, bufB, s, e) {
   return LINK_BUF_B.toString('utf8', 0, p);
 }
 
-function fmBufEq(buf, s, e, lit) {
+function K_fmBufEq(buf, s, e, lit) {
   const n = lit.length;
   if (e - s !== n) return false;
   for (let i = 0; i < n; i++) if (buf[s + i] !== lit.charCodeAt(i)) return false;
@@ -1233,7 +1255,7 @@ function fmBufEq(buf, s, e, lit) {
 const KEY_NAMES = ['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary'];
 const FM_RES = { title: '', date: '', summary: '', layout: '', slug: '', draft: false, tags: null, err: '', bodyStart: 0 };
 
-function parseFrontMatterBuf(buf, bufB, basePos, endLimit, knownClosePos = -1) {
+function K_parseFm(buf, bufB, basePos, endLimit, knownClosePos = -1) {
   const len = endLimit;
   const fm = FM_RES;
   let nl = basePos;
@@ -1295,14 +1317,19 @@ function parseFrontMatterBuf(buf, bufB, basePos, endLimit, knownClosePos = -1) {
       const kLen = colon - pos;
       const k0 = buf[pos];
       let kid = -1;
-      if (kLen === 5 && k0 === 116 && fmBufEq(buf, pos, colon, 'title')) kid = 0;
-      else if (kLen === 4 && k0 === 100 && fmBufEq(buf, pos, colon, 'date')) kid = 1;
-      else if (kLen === 4 && k0 === 116 && fmBufEq(buf, pos, colon, 'tags')) kid = 2;
-      else if (kLen === 5 && k0 === 100 && fmBufEq(buf, pos, colon, 'draft')) kid = 3;
-      else if (kLen === 6 && k0 === 108 && fmBufEq(buf, pos, colon, 'layout')) kid = 4;
-      else if (kLen === 4 && k0 === 115 && fmBufEq(buf, pos, colon, 'slug')) kid = 5;
-      else if (kLen === 7 && k0 === 115 && fmBufEq(buf, pos, colon, 'summary')) kid = 6;
-      else { fm.err = `unknown key "${bufB.toString('utf8', pos, colon)}"`; return false; }
+      if (kLen === 5) {
+        if (k0 === 116 && buf[pos + 1] === 105 && buf[pos + 2] === 116 && buf[pos + 3] === 108 && buf[pos + 4] === 101) kid = 0;
+        else if (k0 === 100 && buf[pos + 1] === 114 && buf[pos + 2] === 97 && buf[pos + 3] === 102 && buf[pos + 4] === 116) kid = 3;
+      } else if (kLen === 4) {
+        if (k0 === 100 && buf[pos + 1] === 97 && buf[pos + 2] === 116 && buf[pos + 3] === 101) kid = 1;
+        else if (k0 === 116 && buf[pos + 1] === 97 && buf[pos + 2] === 103 && buf[pos + 3] === 115) kid = 2;
+        else if (k0 === 115 && buf[pos + 1] === 108 && buf[pos + 2] === 117 && buf[pos + 3] === 103) kid = 5;
+      } else if (kLen === 6) {
+        if (k0 === 108 && buf[pos + 1] === 97 && buf[pos + 2] === 121 && buf[pos + 3] === 111 && buf[pos + 4] === 117 && buf[pos + 5] === 116) kid = 4;
+      } else if (kLen === 7) {
+        if (k0 === 115 && buf[pos + 1] === 117 && buf[pos + 2] === 109 && buf[pos + 3] === 109 && buf[pos + 4] === 97 && buf[pos + 5] === 114 && buf[pos + 6] === 121) kid = 6;
+      }
+      if (kid === -1) { fm.err = `unknown key "${bufB.toString('utf8', pos, colon)}"`; return false; }
 
       const bit = 1 << kid;
       if ((seenMask & bit) !== 0) { fm.err = `key "${KEY_NAMES[kid]}" is given twice`; return false; }
@@ -1313,7 +1340,7 @@ function parseFrontMatterBuf(buf, bufB, basePos, endLimit, knownClosePos = -1) {
         const b0 = buf[vs];
         let val;
         if (b0 === 34) {
-          val = parseQuotedFmBuf(buf, bufB, vs, ve);
+          val = K_parseQuotedFm(buf, bufB, vs, ve);
           if (val === null) { fm.err = `key "${KEY_NAMES[kid]}": ${FM_ERR_Q}`; return false; }
         } else if (b0 === 91) {
           fm.err = `key "${KEY_NAMES[kid]}": a bare string opens on [`;
@@ -1324,11 +1351,11 @@ function parseFrontMatterBuf(buf, bufB, basePos, endLimit, knownClosePos = -1) {
         if (kid === 0) fm.title = val;
         else fm.summary = val;
       } else if (kid === 1) {
-        if (!isValidDateBuf(buf, vs, ve)) { fm.err = 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)'; return false; }
+        if (!K_isValidDate(buf, vs, ve)) { fm.err = 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)'; return false; }
         fm.date = bufB.toString('latin1', vs, ve);
       } else if (kid === 3) {
-        if (fmBufEq(buf, vs, ve, 'true')) fm.draft = true;
-        else if (fmBufEq(buf, vs, ve, 'false')) fm.draft = false;
+        if (K_fmBufEq(buf, vs, ve, 'true')) fm.draft = true;
+        else if (K_fmBufEq(buf, vs, ve, 'false')) fm.draft = false;
         else { fm.err = 'key "draft": true or false'; return false; }
       } else if (kid === 4) {
         for (let k = vs; k < ve; k++) {
@@ -1403,7 +1430,7 @@ function parseFrontMatterBuf(buf, bufB, basePos, endLimit, knownClosePos = -1) {
 // ---------------------------------------------------------------------------
 // Byte-Native Block Markdown Renderer -> writes straight into HBUF
 // ---------------------------------------------------------------------------
-function bufIsBlank(buf, s, e) {
+function K_isBlank(buf, s, e) {
   for (let i = s; i < e; i++) {
     const c = buf[i];
     if (c !== 32 && c !== 9) return false;
@@ -1411,7 +1438,7 @@ function bufIsBlank(buf, s, e) {
   return true;
 }
 
-function bufFenceOpen(buf, s, e) {
+function K_fenceOpen(buf, s, e) {
   if (e - s < 3 || buf[s] !== 96 || buf[s + 1] !== 96 || buf[s + 2] !== 96) return -1;
   let i = s + 3;
   while (i < e && LANG_CC[buf[i]] === 1) i++;
@@ -1424,7 +1451,7 @@ function bufFenceOpen(buf, s, e) {
   return langEnd;
 }
 
-function bufFenceClose(buf, s, e) {
+function K_fenceClose(buf, s, e) {
   if (e - s < 3 || buf[s] !== 96 || buf[s + 1] !== 96 || buf[s + 2] !== 96) return false;
   for (let i = s + 3; i < e; i++) {
     const c = buf[i];
@@ -1433,7 +1460,7 @@ function bufFenceClose(buf, s, e) {
   return true;
 }
 
-function bufIsHr(buf, s, e) {
+function K_isHr(buf, s, e) {
   if (e - s < 3) return false;
   const c = buf[s];
   if ((c !== 45 && c !== 42) || buf[s + 1] !== c || buf[s + 2] !== c) return false;
@@ -1445,7 +1472,7 @@ function bufIsHr(buf, s, e) {
 }
 
 let _bHd = 0, _bHs = 0, _bHe = 0;
-function bufHeading(buf, s, e) {
+function K_heading(buf, s, e) {
   if (s >= e || buf[s] !== 35) return false;
   let d = 1;
   let i = s + 1;
@@ -1460,17 +1487,17 @@ function bufHeading(buf, s, e) {
   return true;
 }
 
-function bufEndsPara(buf, s, e) {
+function K_endsPara(buf, s, e) {
   if (s >= e) return true;
   const c0 = buf[s];
   if (MAY_END_PARA[c0] === 0) return false;
-  if (c0 === 32 || c0 === 9) return bufIsBlank(buf, s, e);
-  if (c0 === 96) return bufFenceOpen(buf, s, e) !== -1;
-  if (c0 === 35) return bufHeading(buf, s, e);
-  return bufIsHr(buf, s, e);
+  if (c0 === 32 || c0 === 9) return K_isBlank(buf, s, e);
+  if (c0 === 96) return K_fenceOpen(buf, s, e) !== -1;
+  if (c0 === 35) return K_heading(buf, s, e);
+  return K_isHr(buf, s, e);
 }
 
-function bufMatchOrd(buf, s, e) {
+function K_matchOrd(buf, s, e) {
   if (s >= e) return -1;
   let i = s, digits = 0;
   while (i < e) {
@@ -1484,17 +1511,17 @@ function bufMatchOrd(buf, s, e) {
   return i + 2;
 }
 
-function bufIsContinued(buf, s, e) {
+function K_isCont(buf, s, e) {
   if (e - s < 3 || buf[s] !== 32 || buf[s + 1] !== 32) return false;
   let i = s + 2;
   while (i < e && buf[i] === 32) i++;
   if (i >= e) return false;
   const c = buf[i];
   if (c < 128) return WS_TBL[c] === 0;
-  return nonAsciiWsStep(buf, i, e) < 0;
+  return K_nonAsciiWs(buf, i, e) < 0;
 }
 
-function appendTrimToPara(buf, s, e, pLen) {
+function K_appendPara(buf, s, e, pLen) {
   while (s < e && (buf[s] === 32 || buf[s] === 9)) s++;
   while (e > s && (buf[e - 1] === 32 || buf[e - 1] === 9)) e--;
   const n = e - s;
@@ -1510,7 +1537,7 @@ function appendTrimToPara(buf, s, e, pLen) {
   return pLen;
 }
 
-function hCopyPre(pre, p) {
+function K_copyPre(pre, p) {
   const n = pre.length;
   const dst = SLAB;
   for (let k = 0; k < n; k++) dst[p++] = pre[k];
@@ -1519,250 +1546,262 @@ function hCopyPre(pre, p) {
 
 const MD_RES = { hp: 0, contentOff: 0, contentLen: 0, excerptOff: 0, excerptLen: 0 };
 const REUSABLE_HIDS = new Set();
+const BLK_NEXT_POS = new Int32Array(1);
 
-function renderMarkdownIntoHBuf(bodyLat, bodyBase, bodyS, bodyE, hpStart, linkCtx, tocOut) {
-  REUSABLE_HIDS.clear();
-  let p = hpStart;
-  const needBase = p + (bodyE - bodyS) * 10 + 262144;
-  if (needBase > SLAB.length) ensureSlab(needBase, p);
+function K_mdDirty(bodyLat, bodyBase, paraStart, prevEnd, p, linkCtx) {
+  const sl = SLAB;
+  let pLen = 0;
+  let p2 = paraStart;
+  let firstLine = true;
+  while (p2 <= prevEnd) {
+    const rel2 = bodyLat.indexOf('\n', p2 - bodyBase);
+    let n2 = rel2 === -1 ? prevEnd : bodyBase + rel2;
+    if (n2 > prevEnd) n2 = prevEnd;
+    let s2 = p2;
+    let e2 = n2;
+    while (s2 < e2 && (sl[s2] === 32 || sl[s2] === 9)) s2++;
+    while (e2 > s2 && (sl[e2 - 1] === 32 || sl[e2 - 1] === 9)) e2--;
+    const subN = e2 - s2;
+    const pb = ensureParaBuf(pLen + subN + 2, pLen);
+    if (firstLine) firstLine = false;
+    else pb[pLen++] = 10;
+    if (subN > 0) {
+      if (subN <= 40) {
+        for (let k = s2; k < e2; k++) pb[pLen++] = sl[k];
+      } else {
+        pb.set(sl.subarray(s2, e2), pLen);
+        pLen += subN;
+      }
+    }
+    if (n2 >= prevEnd) break;
+    p2 = n2 + 1;
+  }
+  if (p + pLen * 10 + 65536 > SLAB.length) ensureSlab(p + pLen * 10 + 65536, p);
+  return KT_mdInline(PARA_BUF, 0, pLen, p, linkCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
+}
+
+function K_mdBlock(bodyLat, bodyBase, pos, nl, len, bodyS, p, linkCtx, tocOut) {
   let sl = SLAB;
-
-  let pos = bodyS;
-  let exOff = 0, exLen = -1;
-  const len = bodyE;
-  const blkTbl = BLK_START;
-
-  while (pos <= len) {
-    if (pos === len && len > bodyS && sl[len - 1] === 10) break;
-    if (p + 65536 > sl.length) sl = ensureSlab(p + (len - pos) * 10 + 262144, p);
-    let rel = bodyLat.indexOf('\n', pos - bodyBase);
-    let nl = rel === -1 ? len : bodyBase + rel;
-    if (nl > len) nl = len;
-    let lEnd = nl;
-    const c0 = pos < lEnd ? sl[pos] : -1;
-
-    if (c0 === -1) {
-      if (pos >= len) break;
+  let lEnd = nl;
+  const c0 = sl[pos];
+  if ((c0 === 32 || c0 === 9) && K_isBlank(sl, pos, lEnd)) {
+    BLK_NEXT_POS[0] = nl + 1;
+    return p;
+  }
+  if (c0 === 96) {
+    const langEnd = K_fenceOpen(sl, pos, lEnd);
+    if (langEnd !== -1) {
+      p = K_copyPre(PRE_FENCE_O, p);
+      if (langEnd > pos + 3) {
+        p = K_copyPre(PRE_FENCE_LANG, p);
+        KT_scanEsc(sl, pos + 3, langEnd, sl, p, HJ_LEN, HJ_FLAT);
+        p = SCAN_P[0];
+        sl[p++] = 92; sl[p++] = 34; // \"
+      }
+      sl[p++] = 62; // >
       pos = nl + 1;
-      continue;
+      while (pos <= len) {
+        if (p + 65536 > sl.length) sl = ensureSlab(p + (len - pos) * 10 + 262144, p);
+        const rel = bodyLat.indexOf('\n', pos - bodyBase);
+        nl = rel === -1 ? len : bodyBase + rel;
+        if (nl > len) nl = len;
+        lEnd = nl;
+        if (K_fenceClose(sl, pos, lEnd)) {
+          pos = nl + 1;
+          break;
+        }
+        if (lEnd > pos) {
+          KT_scanEsc(sl, pos, lEnd, sl, p, HJ_LEN, HJ_FLAT);
+          p = SCAN_P[0];
+        }
+        sl[p++] = 92; sl[p++] = 110; // \n
+        if (pos >= len) { pos = len + 1; break; }
+        pos = nl + 1;
+      }
+      p = K_copyPre(PRE_FENCE_C, p);
+      BLK_NEXT_POS[0] = pos;
+      return p;
     }
-
-    if (blkTbl[c0] === 1) {
-      if ((c0 === 32 || c0 === 9) && bufIsBlank(sl, pos, lEnd)) {
-        if (pos >= len) break;
-        pos = nl + 1;
-        continue;
-      }
-      if (c0 === 96) {
-        const langEnd = bufFenceOpen(sl, pos, lEnd);
-        if (langEnd !== -1) {
-          p = hCopyPre(PRE_FENCE_O, p);
-          if (langEnd > pos + 3) {
-            p = hCopyPre(PRE_FENCE_LANG, p);
-            K_scanEsc(sl, pos + 3, langEnd, sl, p, HJ_LEN, HJ_FLAT);
-            p = SCAN_P[0];
-            sl[p++] = 92; sl[p++] = 34; // \"
-          }
-          sl[p++] = 62; // >
-          pos = nl + 1;
-          while (pos <= len) {
-            if (p + 65536 > sl.length) sl = ensureSlab(p + (len - pos) * 10 + 262144, p);
-            rel = bodyLat.indexOf('\n', pos - bodyBase);
-            nl = rel === -1 ? len : bodyBase + rel;
-            if (nl > len) nl = len;
-            lEnd = nl;
-            if (bufFenceClose(sl, pos, lEnd)) {
-              pos = nl + 1;
-              break;
-            }
-            if (lEnd > pos) {
-              K_scanEsc(sl, pos, lEnd, sl, p, HJ_LEN, HJ_FLAT);
-              p = SCAN_P[0];
-            }
-            sl[p++] = 92; sl[p++] = 110; // \n
-            if (pos >= len) { pos = len + 1; break; }
-            pos = nl + 1;
-          }
-          p = hCopyPre(PRE_FENCE_C, p);
-          continue;
-        }
-      }
-      if (c0 === 35 && bufHeading(sl, pos, lEnd)) {
-        const d = _bHd;
-        const id = uniqueSlug(slugifyBuf(sl, _bHs, _bHe, linkCtx.uCache), REUSABLE_HIDS);
-        sl[p++] = 60; sl[p++] = 104; sl[p++] = 48 + d;
-        sl[p++] = 32; sl[p++] = 105; sl[p++] = 100; sl[p++] = 61; sl[p++] = 92; sl[p++] = 34;
-        const idOff = p;
-        for (let k = 0; k < id.length; k++) sl[p++] = id.charCodeAt(k);
-        const idLen = p - idOff;
-        sl[p++] = 92; sl[p++] = 34; sl[p++] = 62;
-        const hInlStart = p;
-        p = mdInline(sl, _bHs, _bHe, p, linkCtx);
-        sl = SLAB;
-        const hInlLen = p - hInlStart;
-        sl[p++] = 60; sl[p++] = 47; sl[p++] = 104; sl[p++] = 48 + d; sl[p++] = 62; sl[p++] = 92; sl[p++] = 110;
-        if (d === 2 || d === 3) {
-          const tid = tocOut.count;
-          ensureTocCap(tid + 1);
-          VM_S.tocLevel[tid] = d;
-          VM_S.tocIdOff[tid] = idOff;
-          VM_S.tocIdLen[tid] = idLen;
-          VM_S.tocHtmlOff[tid] = hInlStart;
-          VM_S.tocHtmlLen[tid] = hInlLen;
-          tocOut.count = tid + 1;
-        }
-        if (pos >= len) break;
-        pos = nl + 1;
-        continue;
-      }
-      if ((c0 === 45 || c0 === 42) && bufIsHr(sl, pos, lEnd)) {
-        p = hCopyPre(PRE_HR, p);
-        if (pos >= len) break;
-        pos = nl + 1;
-        continue;
-      }
-      if (c0 === 62) {
-        let qLen = 0;
-        while (pos <= len) {
-          if (pos === len && len > bodyS && sl[len - 1] === 10) break;
-          rel = bodyLat.indexOf('\n', pos - bodyBase);
-          nl = rel === -1 ? len : bodyBase + rel;
-          if (nl > len) nl = len;
-          lEnd = nl;
-          if (pos >= lEnd || sl[pos] !== 62) break;
-          let ts = pos + 1;
-          if (ts < lEnd && sl[ts] === 32) ts++;
-          qLen = appendTrimToPara(sl, ts, lEnd, qLen);
-          if (pos >= len) { pos = len + 1; break; }
-          pos = nl + 1;
-        }
-        if (qLen === 0) {
-          p = hCopyPre(PRE_BQ_EMPTY, p);
-        } else {
-          p = hCopyPre(PRE_BQ_O, p);
-          p = mdInline(PARA_BUF, 0, qLen, p, linkCtx);
-          sl = SLAB;
-          p = hCopyPre(PRE_BQ_C, p);
-        }
-        continue;
-      }
-      const isUl = pos + 1 < lEnd && (c0 === 45 || c0 === 42) && sl[pos + 1] === 32;
-      const ordPay = isUl || c0 < 48 || c0 > 57 ? -1 : bufMatchOrd(sl, pos, lEnd);
-      if (isUl || ordPay !== -1) {
-        let startNum = 1;
-        if (!isUl) {
-          startNum = 0;
-          for (let k = pos; k < ordPay - 2; k++) startNum = startNum * 10 + (sl[k] - 48);
-        }
-        if (isUl) p = hCopyPre(PRE_UL_O, p);
-        else if (startNum === 1) p = hCopyPre(PRE_OL_O1, p);
-        else {
-          const sOpen = `<ol start=\\"${startNum}\\">\\n`;
-          for (let k = 0; k < sOpen.length; k++) sl[p++] = sOpen.charCodeAt(k);
-        }
-        let itemLen = -1;
-        while (pos <= len) {
-          if (pos === len && len > bodyS && sl[len - 1] === 10) break;
-          rel = bodyLat.indexOf('\n', pos - bodyBase);
-          nl = rel === -1 ? len : bodyBase + rel;
-          if (nl > len) nl = len;
-          lEnd = nl;
-          let payS = -1;
-          if (isUl) {
-            if (pos + 1 < lEnd && (sl[pos] === 45 || sl[pos] === 42) && sl[pos + 1] === 32) payS = pos + 2;
-          } else {
-            payS = bufMatchOrd(sl, pos, lEnd);
-          }
-          if (payS !== -1) {
-            if (itemLen !== -1) {
-              p = hCopyPre(PRE_LI_O, p);
-              if (itemLen > 0) {
-                if (p + itemLen * 10 + 65536 > sl.length) sl = ensureSlab(p + itemLen * 10 + 262144, p);
-                p = mdInline(PARA_BUF, 0, itemLen, p, linkCtx);
-                sl = SLAB;
-              }
-              p = hCopyPre(PRE_LI_C, p);
-            }
-            itemLen = appendTrimToPara(sl, payS, lEnd, 0);
-          } else if (itemLen !== -1 && bufIsContinued(sl, pos, lEnd)) {
-            itemLen = appendTrimToPara(sl, pos, lEnd, itemLen);
-          } else {
-            break;
-          }
-          if (pos >= len) { pos = len + 1; break; }
-          pos = nl + 1;
-        }
-        if (itemLen !== -1) {
-          p = hCopyPre(PRE_LI_O, p);
-          if (itemLen > 0) {
-            if (p + itemLen * 10 + 65536 > sl.length) sl = ensureSlab(p + itemLen * 10 + 262144, p);
-            p = mdInline(PARA_BUF, 0, itemLen, p, linkCtx);
-            sl = SLAB;
-          }
-          p = hCopyPre(PRE_LI_C, p);
-        }
-        p = hCopyPre(isUl ? PRE_UL_C : PRE_OL_C, p);
-        continue;
-      }
+  }
+  if (c0 === 35 && K_heading(sl, pos, lEnd)) {
+    const d = _bHd;
+    const id = uniqueSlug(K_slugifyBuf(sl, _bHs, _bHe, linkCtx.uCache), REUSABLE_HIDS);
+    sl[p++] = 60; sl[p++] = 104; sl[p++] = 48 + d;
+    sl[p++] = 32; sl[p++] = 105; sl[p++] = 100; sl[p++] = 61; sl[p++] = 92; sl[p++] = 34;
+    const idOff = p;
+    for (let k = 0; k < id.length; k++) sl[p++] = id.charCodeAt(k);
+    const idLen = p - idOff;
+    sl[p++] = 92; sl[p++] = 34; sl[p++] = 62;
+    const hInlStart = p;
+    if (p + (_bHe - _bHs) * 10 + 65536 > sl.length) sl = ensureSlab(p + (_bHe - _bHs) * 10 + 262144, p);
+    p = KT_mdInline(sl, _bHs, _bHe, p, linkCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
+    sl = SLAB;
+    const hInlLen = p - hInlStart;
+    sl[p++] = 60; sl[p++] = 47; sl[p++] = 104; sl[p++] = 48 + d; sl[p++] = 62; sl[p++] = 92; sl[p++] = 110;
+    if (d === 2 || d === 3) {
+      const tid = tocOut.count;
+      ensureTocCap(tid + 1);
+      VM_S.tocLevel[tid] = d;
+      VM_S.tocIdOff[tid] = idOff;
+      VM_S.tocIdLen[tid] = idLen;
+      VM_S.tocHtmlOff[tid] = hInlStart;
+      VM_S.tocHtmlLen[tid] = hInlLen;
+      tocOut.count = tid + 1;
     }
-
-    // Zero-Copy Paragraph!
-    const paraStart = pos;
-    let prevEnd = lEnd;
-    const last0 = lEnd > pos ? sl[lEnd - 1] : 0;
-    let dirty = c0 === 32 || c0 === 9 || last0 === 32 || last0 === 9;
-    pos = nl + 1;
-
+    BLK_NEXT_POS[0] = nl + 1;
+    return p;
+  }
+  if ((c0 === 45 || c0 === 42) && K_isHr(sl, pos, lEnd)) {
+    p = K_copyPre(PRE_HR, p);
+    BLK_NEXT_POS[0] = nl + 1;
+    return p;
+  }
+  if (c0 === 62) {
+    let qLen = 0;
     while (pos <= len) {
       if (pos === len && len > bodyS && sl[len - 1] === 10) break;
-      rel = bodyLat.indexOf('\n', pos - bodyBase);
+      const rel = bodyLat.indexOf('\n', pos - bodyBase);
       nl = rel === -1 ? len : bodyBase + rel;
       if (nl > len) nl = len;
       lEnd = nl;
-      if (bufEndsPara(sl, pos, lEnd)) break;
-      if (!dirty) {
-        const fc = sl[pos];
-        const lc = sl[lEnd - 1];
-        if (fc === 32 || fc === 9 || lc === 32 || lc === 9) dirty = true;
-      }
-      prevEnd = lEnd;
+      if (pos >= lEnd || sl[pos] !== 62) break;
+      let ts = pos + 1;
+      if (ts < lEnd && sl[ts] === 32) ts++;
+      qLen = K_appendPara(sl, ts, lEnd, qLen);
       if (pos >= len) { pos = len + 1; break; }
       pos = nl + 1;
+    }
+    if (qLen === 0) {
+      p = K_copyPre(PRE_BQ_EMPTY, p);
+    } else {
+      if (p + qLen * 10 + 65536 > sl.length) sl = ensureSlab(p + qLen * 10 + 262144, p);
+      p = K_copyPre(PRE_BQ_O, p);
+      p = KT_mdInline(PARA_BUF, 0, qLen, p, linkCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
+      p = K_copyPre(PRE_BQ_C, p);
+    }
+    BLK_NEXT_POS[0] = pos;
+    return p;
+  }
+  const isUl = pos + 1 < lEnd && (c0 === 45 || c0 === 42) && sl[pos + 1] === 32;
+  const ordPay = isUl || c0 < 48 || c0 > 57 ? -1 : K_matchOrd(sl, pos, lEnd);
+  if (isUl || ordPay !== -1) {
+    let startNum = 1;
+    if (!isUl) {
+      startNum = 0;
+      for (let k = pos; k < ordPay - 2; k++) startNum = startNum * 10 + (sl[k] - 48);
+    }
+    if (isUl) p = K_copyPre(PRE_UL_O, p);
+    else if (startNum === 1) p = K_copyPre(PRE_OL_O1, p);
+    else {
+      const sOpen = `<ol start=\\"${startNum}\\">\\n`;
+      for (let k = 0; k < sOpen.length; k++) sl[p++] = sOpen.charCodeAt(k);
+    }
+    let itemLen = -1;
+    while (pos <= len) {
+      if (pos === len && len > bodyS && sl[len - 1] === 10) break;
+      const rel = bodyLat.indexOf('\n', pos - bodyBase);
+      nl = rel === -1 ? len : bodyBase + rel;
+      if (nl > len) nl = len;
+      lEnd = nl;
+      let payS = -1;
+      if (isUl) {
+        if (pos + 1 < lEnd && (sl[pos] === 45 || sl[pos] === 42) && sl[pos + 1] === 32) payS = pos + 2;
+      } else {
+        payS = K_matchOrd(sl, pos, lEnd);
+      }
+      if (payS !== -1) {
+        if (itemLen !== -1) {
+          p = K_copyPre(PRE_LI_O, p);
+          if (itemLen > 0) {
+            if (p + itemLen * 10 + 65536 > sl.length) sl = ensureSlab(p + itemLen * 10 + 262144, p);
+            p = KT_mdInline(PARA_BUF, 0, itemLen, p, linkCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
+            sl = SLAB;
+          }
+          p = K_copyPre(PRE_LI_C, p);
+        }
+        itemLen = K_appendPara(sl, payS, lEnd, 0);
+      } else if (itemLen !== -1 && K_isCont(sl, pos, lEnd)) {
+        itemLen = K_appendPara(sl, pos, lEnd, itemLen);
+      } else {
+        break;
+      }
+      if (pos >= len) { pos = len + 1; break; }
+      pos = nl + 1;
+    }
+    if (itemLen !== -1) {
+      p = K_copyPre(PRE_LI_O, p);
+      if (itemLen > 0) {
+        if (p + itemLen * 10 + 65536 > sl.length) sl = ensureSlab(p + itemLen * 10 + 262144, p);
+        p = KT_mdInline(PARA_BUF, 0, itemLen, p, linkCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
+      }
+      p = K_copyPre(PRE_LI_C, p);
+    }
+    p = K_copyPre(isUl ? PRE_UL_C : PRE_OL_C, p);
+    BLK_NEXT_POS[0] = pos;
+    return p;
+  }
+  return -1;
+}
+
+function KT_renderMd(bodyLat, bodyBase, bodyS, bodyE, hpStart, linkCtx, tocOut, blkTbl, mayEndTbl) {
+  REUSABLE_HIDS.clear();
+  let p = hpStart | 0;
+  const len = bodyE | 0;
+  const base = bodyBase | 0;
+  const needBase = p + (len - bodyS) * 10 + 262144;
+  if (needBase > SLAB.length) ensureSlab(needBase, p);
+  let sl = SLAB;
+
+  let pos = bodyS | 0;
+  let exOff = 0, exLen = -1;
+
+  while (pos < len) {
+    while (pos < len && sl[pos] === 10) pos++;
+    if (pos >= len) break;
+    if (p + 65536 > sl.length) sl = ensureSlab(p + (len - pos) * 10 + 262144, p);
+    const rel = bodyLat.indexOf('\n', pos - base);
+    let nl = rel === -1 ? len : base + rel;
+    if (nl > len) nl = len;
+    const c0 = sl[pos];
+
+    if (blkTbl[c0] === 1) {
+      const nextP = K_mdBlock(bodyLat, base, pos, nl, len, bodyS, p, linkCtx, tocOut);
+      if (nextP >= 0) {
+        p = nextP;
+        sl = SLAB;
+        pos = BLK_NEXT_POS[0];
+        continue;
+      }
+    }
+
+    const paraStart = pos;
+    let prevEnd = nl;
+    const last0 = nl > pos ? sl[nl - 1] : 0;
+    let dirty = c0 === 32 || c0 === 9 || last0 === 32 || last0 === 9;
+    pos = nl + 1;
+
+    while (pos < len) {
+      const fc = sl[pos];
+      if (fc === 10) break;
+      const r2 = bodyLat.indexOf('\n', pos - base);
+      let nl2 = r2 === -1 ? len : base + r2;
+      if (nl2 > len) nl2 = len;
+      if (mayEndTbl[fc] === 1 && K_endsPara(sl, pos, nl2)) break;
+      if (!dirty) {
+        const lc = sl[nl2 - 1];
+        if (fc === 32 || fc === 9 || lc === 32 || lc === 9) dirty = true;
+      }
+      prevEnd = nl2;
+      pos = nl2 + 1;
     }
 
     sl[p++] = 60; sl[p++] = 112; sl[p++] = 62; // <p>
     const inlStart = p;
     if (!dirty) {
-      p = mdInline(sl, paraStart, prevEnd, p, linkCtx);
+      p = KT_mdInline(sl, paraStart, prevEnd, p, linkCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
       sl = SLAB;
     } else {
-      let pLen = 0;
-      let p2 = paraStart;
-      let firstLine = true;
-      while (p2 <= prevEnd) {
-        let rel2 = bodyLat.indexOf('\n', p2 - bodyBase);
-        let n2 = rel2 === -1 ? prevEnd : bodyBase + rel2;
-        if (n2 > prevEnd) n2 = prevEnd;
-        const le2 = n2;
-        while (p2 < le2 && (sl[p2] === 32 || sl[p2] === 9)) p2++;
-        let e2 = le2;
-        while (e2 > p2 && (sl[e2 - 1] === 32 || sl[e2 - 1] === 9)) e2--;
-        const subN = e2 - p2;
-        const pb = ensureParaBuf(pLen + subN + 2, pLen);
-        if (firstLine) firstLine = false;
-        else pb[pLen++] = 10;
-        if (subN > 0) {
-          if (subN <= 40) {
-            for (let k = p2; k < e2; k++) pb[pLen++] = sl[k];
-          } else {
-            pb.set(sl.subarray(p2, e2), pLen);
-            pLen += subN;
-          }
-        }
-        if (n2 >= prevEnd) break;
-        p2 = n2 + 1;
-      }
-      p = mdInline(PARA_BUF, 0, pLen, p, linkCtx);
+      p = K_mdDirty(bodyLat, base, paraStart, prevEnd, p, linkCtx);
       sl = SLAB;
     }
     if (exLen === -1) {
@@ -2187,7 +2226,7 @@ function compileTemplateVm(nodes, tplKind, hpBox) {
 // ---------------------------------------------------------------------------
 // Raw-UTF8 JSON Cases Streamer (Zero JSON.parse on .md/.static contents!)
 // ---------------------------------------------------------------------------
-function skipWs(buf, i, len) {
+function K_skipWs(buf, i, len) {
   while (i < len) {
     const b = buf[i];
     if (b === 32 || b === 9 || b === 10 || b === 13) i++;
@@ -2197,16 +2236,16 @@ function skipWs(buf, i, len) {
 }
 
 function skipJsonVal(buf, lat, i, len) {
-  i = skipWs(buf, i, len);
+  i = K_skipWs(buf, i, len);
   const b = buf[i];
-  if (b === 34) return findStrEnd(lat, i + 1) + 1;
+  if (b === 34) return KT_findStrEnd(lat, i + 1) + 1;
   if (b === 123 || b === 91) {
     let depth = 1;
     i++;
     while (i < len && depth > 0) {
       const c = buf[i];
       if (c === 34) {
-        i = findStrEnd(lat, i + 1) + 1;
+        i = KT_findStrEnd(lat, i + 1) + 1;
       } else if (c === 123 || c === 91) {
         depth++; i++;
       } else if (c === 125 || c === 93) {
@@ -2225,41 +2264,41 @@ function skipJsonVal(buf, lat, i, len) {
   return i;
 }
 
-function decodeJsonStrSpan(bufB, lat, s, e) {
+function K_decodeJsonStrSpan(bufB, lat, s, e) {
   const esc = lat.indexOf('\\', s);
   if (esc === -1 || esc >= e) return bufB.toString('utf8', s, e);
   return JSON.parse(bufB.toString('utf8', s - 1, e + 1));
 }
 
-function parseFilesRaw(buf, bufB, lat, i, len) {
-  i = skipWs(buf, i, len); // '['
+function K_parseFiles(buf, bufB, lat, i, len) {
+  i = K_skipWs(buf, i, len); // '['
   i++;
   const files = [];
   while (i < len) {
-    i = skipWs(buf, i, len);
+    i = K_skipWs(buf, i, len);
     if (buf[i] === 93) { i++; break; }
-    if (buf[i] === 44) { i++; i = skipWs(buf, i, len); }
+    if (buf[i] === 44) { i++; i = K_skipWs(buf, i, len); }
     // '{'
     i++;
     let pathStr = '';
     let cs = 0, ce = 0;
     while (i < len) {
-      i = skipWs(buf, i, len);
+      i = K_skipWs(buf, i, len);
       if (buf[i] === 125) { i++; break; }
-      if (buf[i] === 44) { i++; i = skipWs(buf, i, len); }
+      if (buf[i] === 44) { i++; i = K_skipWs(buf, i, len); }
       const ks = i + 1;
-      const ke = findStrEnd(lat, ks);
+      const ke = KT_findStrEnd(lat, ks);
       const kl = ke - ks;
-      i = skipWs(buf, ke + 1, len); // ':'
-      i = skipWs(buf, i + 1, len);
+      i = K_skipWs(buf, ke + 1, len); // ':'
+      i = K_skipWs(buf, i + 1, len);
       if (kl === 4 && buf[ks] === 112 && buf[ks + 1] === 97 && buf[ks + 2] === 116 && buf[ks + 3] === 104) {
         const vs = i + 1;
-        const ve = findStrEnd(lat, vs);
-        pathStr = decodeJsonStrSpan(bufB, lat, vs, ve);
+        const ve = KT_findStrEnd(lat, vs);
+        pathStr = K_decodeJsonStrSpan(bufB, lat, vs, ve);
         i = ve + 1;
       } else if (kl === 7 && buf[ks] === 99 && buf[ks + 1] === 111 && buf[ks + 2] === 110 && buf[ks + 3] === 116 && buf[ks + 4] === 101 && buf[ks + 5] === 110 && buf[ks + 6] === 116) {
         const vs = i + 1;
-        const ve = findStrEnd(lat, vs);
+        const ve = KT_findStrEnd(lat, vs);
         cs = vs; ce = ve;
         i = ve + 1;
       } else {
@@ -2272,18 +2311,18 @@ function parseFilesRaw(buf, bufB, lat, i, len) {
 }
 
 function parseInputObjRaw(buf, bufB, lat, i, len) {
-  i = skipWs(buf, i, len); // '{'
+  i = K_skipWs(buf, i, len); // '{'
   i++;
   let site = null, templates = null, files = null;
   while (i < len) {
-    i = skipWs(buf, i, len);
+    i = K_skipWs(buf, i, len);
     if (buf[i] === 125) { i++; break; }
-    if (buf[i] === 44) { i++; i = skipWs(buf, i, len); }
+    if (buf[i] === 44) { i++; i = K_skipWs(buf, i, len); }
     const ks = i + 1;
-    const ke = findStrEnd(lat, ks);
+    const ke = KT_findStrEnd(lat, ks);
     const key = bufB.toString('latin1', ks, ke);
-    i = skipWs(buf, ke + 1, len); // ':'
-    i = skipWs(buf, i + 1, len);
+    i = K_skipWs(buf, ke + 1, len); // ':'
+    i = K_skipWs(buf, i + 1, len);
     if (key === 'site' || key === 'templates') {
       const vs = i;
       const ve = skipJsonVal(buf, lat, vs, len);
@@ -2291,7 +2330,7 @@ function parseInputObjRaw(buf, bufB, lat, i, len) {
       if (key === 'site') site = obj; else templates = obj;
       i = ve;
     } else if (key === 'files') {
-      const res = parseFilesRaw(buf, bufB, lat, i, len);
+      const res = K_parseFiles(buf, bufB, lat, i, len);
       files = res[0];
       i = res[1];
     } else {
@@ -2302,25 +2341,25 @@ function parseInputObjRaw(buf, bufB, lat, i, len) {
 }
 
 function parseCasesRaw(buf, bufB, lat, len) {
-  let i = skipWs(buf, 0, len); // '['
+  let i = K_skipWs(buf, 0, len); // '['
   i++;
   const out = [];
   while (i < len) {
-    i = skipWs(buf, i, len);
+    i = K_skipWs(buf, i, len);
     if (buf[i] === 93) break;
-    if (buf[i] === 44) { i++; i = skipWs(buf, i, len); }
+    if (buf[i] === 44) { i++; i = K_skipWs(buf, i, len); }
     // case object '{'
     i++;
     let inp = null;
     while (i < len) {
-      i = skipWs(buf, i, len);
+      i = K_skipWs(buf, i, len);
       if (buf[i] === 125) { i++; break; }
-      if (buf[i] === 44) { i++; i = skipWs(buf, i, len); }
+      if (buf[i] === 44) { i++; i = K_skipWs(buf, i, len); }
       const ks = i + 1;
-      const ke = findStrEnd(lat, ks);
+      const ke = KT_findStrEnd(lat, ks);
       const key = bufB.toString('latin1', ks, ke);
-      i = skipWs(buf, ke + 1, len); // ':'
-      i = skipWs(buf, i + 1, len);
+      i = K_skipWs(buf, ke + 1, len); // ':'
+      i = K_skipWs(buf, i + 1, len);
       if (key === 'input') {
         const res = parseInputObjRaw(buf, bufB, lat, i, len);
         inp = res[0];
@@ -2355,7 +2394,20 @@ const dirOf = (p) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
 
 const OWN_TAG_SEEN = new Set();
 
-function writeSlotFieldH(str, offArr, lenArr, slotIdx, hpBox) {
+function writeFieldHSlow(str, n, offArr, lenArr, slotIdx, hpBox) {
+  const lb = n * 3 + 16 > LINK_BUF.length ? ensureLinkBuf(n * 3 + 16) : LINK_BUF;
+  const nb = LINK_BUF_B.utf8Write(str, 0);
+  const hp = hpBox.hp;
+  const maxB = nb * 6 + 16;
+  const dst = hp + maxB > SLAB.length ? ensureSlab(hp + maxB, hp) : SLAB;
+  KT_scanEsc(lb, 0, nb, dst, hp, HJ_LEN, HJ_FLAT);
+  const endP = SCAN_P[0];
+  offArr[slotIdx] = hp;
+  lenArr[slotIdx] = endP - hp;
+  hpBox.hp = endP;
+}
+
+function KT_writeFieldH(str, offArr, lenArr, slotIdx, hpBox, hj) {
   const n = str.length;
   if (n === 0) {
     offArr[slotIdx] = 0;
@@ -2365,35 +2417,28 @@ function writeSlotFieldH(str, offArr, lenArr, slotIdx, hpBox) {
   const hp = hpBox.hp;
   const maxB = n * 6 + 16;
   const h = hp + maxB > SLAB.length ? ensureSlab(hp + maxB, hp) : SLAB;
-  const hj = HJ_LEN;
-  let asciiClean = true;
-  for (let i = 0; i < n; i++) {
+  let i = 0;
+  for (; i < n; i++) {
     const c = str.charCodeAt(i);
-    if (c >= 128 || hj[c] !== 0) { asciiClean = false; break; }
+    if (c >= 128 || hj[c] !== 0) break;
     h[hp + i] = c;
   }
-  if (asciiClean) {
+  if (i === n) {
     offArr[slotIdx] = hp;
     lenArr[slotIdx] = n;
     hpBox.hp = hp + n;
     return;
   }
-  const esc = escHtmlJsonStr(str);
-  const escMax = esc.length * 3 + 16;
-  if (hp + escMax > SLAB.length) ensureSlab(hp + escMax, hp);
-  const len = SLAB_BUF.utf8Write(esc, hp);
-  offArr[slotIdx] = hp;
-  lenArr[slotIdx] = len;
-  hpBox.hp = hp + len;
+  writeFieldHSlow(str, n, offArr, lenArr, slotIdx, hpBox);
 }
 
 function cachedSlug(name, slugCache, uCache) {
   let sl = slugCache.get(name);
-  if (sl === undefined) { sl = slugifyStr(name, uCache); slugCache.set(name, sl); }
+  if (sl === undefined) { sl = K_slugifyStr(name, uCache); slugCache.set(name, sl); }
   return sl;
 }
 
-function openKv(kStr, op, sepByte, staticHtmlSet, shadowedSet) {
+function K_openKv(kStr, op, sepByte, staticHtmlSet, shadowedSet) {
   if (staticHtmlSet !== null && staticHtmlSet.has(kStr)) shadowedSet.add(kStr);
   const kn = kStr.length;
   const need = op + kn * 6 + 16;
@@ -2416,7 +2461,7 @@ function openKv(kStr, op, sepByte, staticHtmlSet, shadowedSet) {
   return op;
 }
 
-function openKvPage(outDir, op, sepByte, staticHtmlSet, shadowedSet) {
+function K_openKvPage(outDir, op, sepByte, staticHtmlSet, shadowedSet) {
   if (staticHtmlSet !== null) {
     const full = outDir + '/index.html';
     if (staticHtmlSet.has(full)) shadowedSet.add(full);
@@ -2444,7 +2489,7 @@ function openKvPage(outDir, op, sepByte, staticHtmlSet, shadowedSet) {
   return op;
 }
 
-function closeKv(op) {
+function K_closeKv(op) {
   const dst = op + 4 > SLAB.length ? ensureSlab(op + 4, op) : SLAB;
   dst[op++] = 34;
   return op;
@@ -2563,7 +2608,7 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
     let usedFmFirst = false;
 
     if (fmFirst) {
-      const fmRawEnd = findRawFmEnd(SLAB, rawLat, src.rawS, src.rawE);
+      const fmRawEnd = K_findRawFmEnd(SLAB, rawLat, src.rawS, src.rawE);
       if (fmRawEnd === -2) {
         report.push(`refused ${src.path}: no front matter`);
         continue;
@@ -2574,10 +2619,10 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
       }
       const rawFmLen = fmRawEnd - src.rawS;
       const fmDst = rawFmLen + 16 > FM_BUF.length ? ensureFmBuf(rawFmLen + 16) : FM_BUF;
-      const fmLen = unescSmall(SLAB, src.rawS, fmRawEnd, fmDst, UNESC_TBL);
+      const fmLen = K_unescSmall(SLAB, src.rawS, fmRawEnd, fmDst, UNESC_TBL);
       if (fmLen !== -1) {
         usedFmFirst = true;
-        if (!parseFrontMatterBuf(fmDst, FM_BUF_B, 0, fmLen, fmLen - 3)) {
+        if (!K_parseFm(fmDst, FM_BUF_B, 0, fmLen, fmLen - 3)) {
           report.push(`refused ${src.path}: ${fm.err}`);
           continue;
         }
@@ -2601,7 +2646,7 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
         const bodyRawS = FM_RAW_BODY_S;
         const bodySpan = src.rawE - bodyRawS;
         if (fileStart + bodySpan + 16 > SLAB.length) ensureSlab(fileStart + bodySpan + 16, fileStart);
-        let mdBodyLen = bodySpan > 0 ? K_unescIdxOfCW(SLAB, rawLat, bodyRawS, src.rawE, fileStart, UNESC_TBL) : 0;
+        let mdBodyLen = bodySpan > 0 ? KT_unescIdxOfCW(SLAB, rawLat, bodyRawS, src.rawE, fileStart, UNESC_TBL) : 0;
         if (mdBodyLen === -1) {
           const bNorm = JSON.parse('"' + SLAB_BUF.toString('utf8', bodyRawS, src.rawE) + '"').replace(/\r\n?/g, '\n');
           const bNeed = Buffer.byteLength(bNorm, 'utf8') + 16;
@@ -2618,7 +2663,7 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
       if (rawLen > 0) {
         const spanLen = src.rawE - src.rawS;
         if (fileStart + spanLen + 16 > SLAB.length) ensureSlab(fileStart + spanLen + 16, fileStart);
-        mdLen = K_unescIdxOfCW(SLAB, rawLat, src.rawS, src.rawE, fileStart, UNESC_TBL);
+        mdLen = KT_unescIdxOfCW(SLAB, rawLat, src.rawS, src.rawE, fileStart, UNESC_TBL);
         if (mdLen === -1) {
           const sNorm = JSON.parse(SLAB_BUF.toString('utf8', src.rawS - 1, src.rawE + 1)).replace(/\r\n?/g, '\n');
           const bNeed = Buffer.byteLength(sNorm, 'utf8') + 16;
@@ -2632,7 +2677,7 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
         mdLen = SLAB_BUF.utf8Write(sNorm, fileStart);
       }
       fileEnd = fileStart + mdLen;
-      if (!parseFrontMatterBuf(SLAB, SLAB_BUF, fileStart, fileEnd)) {
+      if (!K_parseFm(SLAB, SLAB_BUF, fileStart, fileEnd)) {
         report.push(`refused ${src.path}: ${fm.err}`);
         continue;
       }
@@ -2664,7 +2709,7 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
       tSet = new Set(dir === '' ? RESERVED : undefined);
       takenMap.set(dir, tSet);
     }
-    const slug = uniqueSlug(fm.slug !== '' ? fm.slug : slugifyStr(fm.title, uCache), tSet);
+    const slug = uniqueSlug(fm.slug !== '' ? fm.slug : K_slugifyStr(fm.title, uCache), tSet);
     const outDir = dir === '' ? slug : `${dir}/${slug}`;
     const url = `${base}/${outDir}/`;
     const item = {
@@ -2698,10 +2743,10 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
   const bodyLat = bodyEnd > bodyBase ? SLAB_BUF.toString('latin1', bodyBase, bodyEnd) : '';
   const hpBox = { hp: bodyEnd };
 
-  // Pre-write every kept page's URL first so writeResolvedHref can copyWithin U8 bytes directly!
+  // Pre-write every kept page's URL first so K_writeHref can copyWithin U8 bytes directly!
   for (let i = 0; i < kept.length; i++) {
     const it = kept[i];
-    writeSlotFieldH(it.url, S.pOff, S.pLen, it.pid * PF_STRIDE + 1, hpBox);
+    KT_writeFieldH(it.url, S.pOff, S.pLen, it.pid * PF_STRIDE + 1, hpBox, HJ_LEN);
   }
 
   const broken = new Set();
@@ -2735,21 +2780,22 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
     const bS = it.bodyStart;
     const bE = it.bodyEnd;
     S.pTocStart[pid] = tocOut.count;
-    renderMarkdownIntoHBuf(bodyLat, bodyBase, bS, bE, hpBox.hp, linkCtx, tocOut);
+    KT_renderMd(bodyLat, bodyBase, bS, bE, hpBox.hp, linkCtx, tocOut, BLK_START, MAY_END_PARA);
     hpBox.hp = mdr.hp;
     S.pTocCount[pid] = tocOut.count - S.pTocStart[pid];
 
-    const words = K_words4(SLAB, bS, bE, W_CLS);
-    S.pReadMin[pid] = Math.max(1, Math.ceil(words / 200));
+    const words = KT_words4(SLAB, bS, bE, W_CLS);
+    const rm = ((words + 199) / 200) | 0;
+    S.pReadMin[pid] = rm > 1 ? rm : 1;
     S.pIsPost[pid] = it.post ? 1 : 0;
 
     const pBase = pid * PF_STRIDE;
-    writeSlotFieldH(it.title, S.pOff, S.pLen, pBase, hpBox);
-    writeSlotFieldH(it.date, S.pOff, S.pLen, pBase + 2, hpBox);
+    KT_writeFieldH(it.title, S.pOff, S.pLen, pBase, hpBox, HJ_LEN);
+    KT_writeFieldH(it.date, S.pOff, S.pLen, pBase + 2, hpBox, HJ_LEN);
     const dl = it.date === '' ? '' : longDate(it.date);
-    writeSlotFieldH(dl, S.pOff, S.pLen, pBase + 3, hpBox);
-    writeSlotFieldH(it.summary, S.pOff, S.pLen, pBase + 4, hpBox);
-    writeSlotFieldH(it.slug, S.pOff, S.pLen, pBase + 5, hpBox);
+    KT_writeFieldH(dl, S.pOff, S.pLen, pBase + 3, hpBox, HJ_LEN);
+    KT_writeFieldH(it.summary, S.pOff, S.pLen, pBase + 4, hpBox, HJ_LEN);
+    KT_writeFieldH(it.slug, S.pOff, S.pLen, pBase + 5, hpBox, HJ_LEN);
     S.pOff[pBase + 6] = mdr.excerptOff; S.pLen[pBase + 6] = mdr.excerptLen;
     S.pOff[pBase + 7] = mdr.contentOff; S.pLen[pBase + 7] = mdr.contentLen;
     it.dateLong = dl;
@@ -2835,9 +2881,9 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
   for (let i = 0; i < allTagsList.length; i++) {
     const t = allTagsList[i];
     const tb = i * TF_STRIDE;
-    writeSlotFieldH(t.name, S.tOff, S.tLen, tb, hpBox);
-    writeSlotFieldH(t.slug, S.tOff, S.tLen, tb + 1, hpBox);
-    writeSlotFieldH(t.url, S.tOff, S.tLen, tb + 2, hpBox);
+    KT_writeFieldH(t.name, S.tOff, S.tLen, tb, hpBox, HJ_LEN);
+    KT_writeFieldH(t.slug, S.tOff, S.tLen, tb + 1, hpBox, HJ_LEN);
+    KT_writeFieldH(t.url, S.tOff, S.tLen, tb + 2, hpBox, HJ_LEN);
     if (t.posts !== null) {
       S.tCount[i] = t.posts.length;
       S.tPostStart[i] = tagPostCursor;
@@ -2880,23 +2926,25 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
       pageTplByLayout.set(lay, getCompiledTpl(lay, 'page', rawTpls, compiledTpls, siteScope, hpBox));
     }
   }
-  const per = inp.site.per_page;
-  const pages = Math.max(1, Math.ceil(posts.length / per));
+  const per = inp.site.per_page | 0;
+  const pages = posts.length > 0 ? (((posts.length + per - 1) / per) | 0) : 1;
   const indexComp = getCompiledTpl('index', 'index', rawTpls, compiledTpls, siteScope, hpBox);
   const tagComp = getCompiledTpl('tag', 'tag', rawTpls, compiledTpls, siteScope, hpBox);
   const tagsComp = getCompiledTpl('tags', 'tags', rawTpls, compiledTpls, siteScope, hpBox);
 
-  const pagerBase = hpBox.hp;
-  const pagerCap = Math.max(4096, base.length * 18 + 2048);
+  const pagerBase = hpBox.hp | 0;
+  const pagerNeed = (base.length * 18 + 2048) | 0;
+  const pagerCap = pagerNeed > 4096 ? pagerNeed : 4096;
   const pagerHpBox = { hp: pagerBase };
-  const pagerEnd = pagerBase + pagerCap;
+  const pagerEnd = (pagerBase + pagerCap) | 0;
 
   const cardBase = pagerEnd;
-  const cardCap = Math.max(512 * 1024, posts.length * 1024);
+  const cardNeed = (posts.length * 1024) | 0;
+  const cardCap = cardNeed > 524288 ? cardNeed : 524288;
   S.cp = cardBase;
-  S.cardLimit = cardBase + cardCap;
+  S.cardLimit = (cardBase + cardCap) | 0;
 
-  const outBase = S.cardLimit + (prefixByte !== 0 ? 1 : 0);
+  const outBase = (S.cardLimit + (prefixByte !== 0 ? 1 : 0)) | 0;
   ensureSlab(outBase + 4 * 1024 * 1024, cardBase);
   if (prefixByte !== 0) SLAB[outBase - 1] = prefixByte;
   let op = outBase;
@@ -2916,15 +2964,15 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
   for (let i = 0; i < kept.length; i++) {
     const it = kept[i];
     const comp = pageTplByLayout.get(it.layout);
-    op = openKvPage(it.outDir, op, sep, staticHtmlSet, shadowedSet); sep = 44;
+    op = K_openKvPage(it.outDir, op, sep, staticHtmlSet, shadowedSet); sep = 44;
     if (!comp.needsDynScope) {
       S.regVal[0] = it.pid;
-      op = execVm(comp.ops, comp.nWords, op, S);
+      op = KT_execVm(comp.ops, comp.nWords, op, S);
     } else {
       const sc = { vars: { site: siteVar, tags: tagCardsDyn, recent: recentDyn, page: makeDynPage(it, kept, S) }, parent: null };
       op = writeOutEscJsonStr(renderDynamicPlain(comp.nodes, sc), op);
     }
-    op = closeKv(op);
+    op = K_closeKv(op);
   }
 
   // Render index pages
@@ -2934,23 +2982,24 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
       const nUrl = k === 1 ? '' : (k === 2 ? `${base}/` : `${base}/page/${k - 1}/`);
       const oUrl = k === pages ? '' : `${base}/page/${k + 1}/`;
       const start = (k - 1) * per;
-      const cnt = Math.max(0, Math.min(posts.length, k * per) - start);
-      op = openKv(k === 1 ? 'index.html' : `page/${k}/index.html`, op, sep, staticHtmlSet, shadowedSet); sep = 44;
+      const endP = k * per;
+      const cnt = (endP < posts.length ? endP : posts.length) - start;
+      op = K_openKv(k === 1 ? 'index.html' : `page/${k}/index.html`, op, sep, staticHtmlSet, shadowedSet); sep = 44;
       if (!indexComp.needsDynScope) {
         pagerHpBox.hp = pagerBase;
-        writeSlotFieldH(url, S.pgOff, S.pgLen, 0, pagerHpBox);
-        writeSlotFieldH(nUrl, S.pgOff, S.pgLen, 1, pagerHpBox);
-        writeSlotFieldH(oUrl, S.pgOff, S.pgLen, 2, pagerHpBox);
+        KT_writeFieldH(url, S.pgOff, S.pgLen, 0, pagerHpBox, HJ_LEN);
+        KT_writeFieldH(nUrl, S.pgOff, S.pgLen, 1, pagerHpBox, HJ_LEN);
+        KT_writeFieldH(oUrl, S.pgOff, S.pgLen, 2, pagerHpBox, HJ_LEN);
         S.pgNumber = k; S.pgTotal = pages;
         S.curPostStart = start; S.curPostLen = cnt;
-        op = execVm(indexComp.ops, indexComp.nWords, op, S);
+        op = KT_execVm(indexComp.ops, indexComp.nWords, op, S);
       } else {
         const slPosts = posts.slice(start, start + cnt).map((p) => makeDynCard(p, S));
         const pager = { number: k, total: pages, url, newer_url: nUrl, older_url: oUrl };
         const sc = { vars: { site: siteVar, tags: tagCardsDyn, recent: recentDyn, posts: slPosts, pager }, parent: null };
         op = writeOutEscJsonStr(renderDynamicPlain(indexComp.nodes, sc), op);
       }
-      op = closeKv(op);
+      op = K_closeKv(op);
     }
   }
 
@@ -2958,28 +3007,28 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
   if (tagComp !== null) {
     for (let i = 0; i < realTags.length; i++) {
       const tp = realTags[i];
-      op = openKv(`tags/${tp.slug}/index.html`, op, sep, staticHtmlSet, shadowedSet); sep = 44;
+      op = K_openKv(`tags/${tp.slug}/index.html`, op, sep, staticHtmlSet, shadowedSet); sep = 44;
       if (!tagComp.needsDynScope) {
         S.regVal[0] = tp.tid;
-        op = execVm(tagComp.ops, tagComp.nWords, op, S);
+        op = KT_execVm(tagComp.ops, tagComp.nWords, op, S);
       } else {
         const tagVar = { name: tp.name, slug: tp.slug, url: tp.url, count: tp.posts.length, posts: tp.posts.map((p) => makeDynCard(p, S)) };
         const sc = { vars: { site: siteVar, tags: tagCardsDyn, recent: recentDyn, tag: tagVar }, parent: null };
         op = writeOutEscJsonStr(renderDynamicPlain(tagComp.nodes, sc), op);
       }
-      op = closeKv(op);
+      op = K_closeKv(op);
     }
   }
 
   // Render tags index
   if (tagsComp !== null) {
-    op = openKv('tags/index.html', op, sep, staticHtmlSet, shadowedSet); sep = 44;
+    op = K_openKv('tags/index.html', op, sep, staticHtmlSet, shadowedSet); sep = 44;
     if (!tagsComp.needsDynScope) {
-      op = execVm(tagsComp.ops, tagsComp.nWords, op, S);
+      op = KT_execVm(tagsComp.ops, tagsComp.nWords, op, S);
     } else {
       op = writeOutEscJsonStr(renderDynamicPlain(tagsComp.nodes, siteScope), op);
     }
-    op = closeKv(op);
+    op = K_closeKv(op);
   }
 
   // Render static files (ZERO-COPY inside SLAB!)
@@ -2992,7 +3041,7 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
     }
     if (seenStatic !== null) seenStatic.add(f.path);
     if (f.path === 'build-report.txt') continue;
-    op = openKv(f.path, op, sep, null, null); sep = 44;
+    op = K_openKv(f.path, op, sep, null, null); sep = 44;
     if (rawLen > 0) {
       const rLen = f.rawE - f.rawS;
       if (op + rLen + 16 > SLAB.length) ensureSlab(op + rLen + 16, op);
@@ -3001,15 +3050,15 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
     } else {
       op = writeOutEscJsonStr(f.jsContent, op);
     }
-    op = closeKv(op);
+    op = K_closeKv(op);
   }
 
   // Build report
   const rLines = [...report, ...broken].sort(byCodeUnits);
   rLines.push(`built ${kept.length - posts.length} pages, ${posts.length} posts, ${realTags.length} tags and ${statics.length} static files`);
-  op = openKv('build-report.txt', op, sep, null, null);
+  op = K_openKv('build-report.txt', op, sep, null, null);
   op = writeOutEscJsonStr(`${rLines.join('\n')}\n`, op);
-  op = closeKv(op);
+  op = K_closeKv(op);
 
   if (op + 8 > SLAB.length) ensureSlab(op + 8, op);
   SLAB[op++] = 125; // '}'
@@ -3023,9 +3072,60 @@ function writeFdAll(fd, buf, start, len) {
   while (off < len) off += writeSync(fd, buf, start + off, len - off);
 }
 
+let FEEDBACK_SEEDED = false;
+function seedFeedback() {
+  if (FEEDBACK_SEEDED) return;
+  FEEDBACK_SEEDED = true;
+  const sample = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa **a *b* c** *d **e** f* *x `c` `y \\* \\> \\\\ & [t](https://a) [u';
+  const n = SLAB_BUF.utf8Write(sample, 0);
+  const dummyCtx = { dir: '', upPrefix: [''], dirParts: [], bySource: new Map(), staticSet: new Set(), broken: new Set(), base: '', srcPath: '', uCache: null };
+  KT_mdInline(SLAB, 0, n, 256, dummyCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
+  const np = PARA_BUF_B.utf8Write(sample, 0);
+  KT_mdInline(PARA_BUF, 0, np, 512, dummyCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
+
+  const dummyHp = { hp: 512 };
+  KT_writeFieldH('abc', VM_S.pOff, VM_S.pLen, 0, dummyHp, HJ_LEN);
+  KT_writeFieldH('a&é', VM_S.pOff, VM_S.pLen, 1, dummyHp, HJ_LEN);
+
+  SLAB_BUF.latin1Write('01234567890123456789012345678901234567890123456', 1024);
+  VM_S.pOff[0] = 1024; VM_S.pLen[0] = 45;
+  VM_S.pOff[PF_STRIDE] = 1024; VM_S.pLen[PF_STRIDE] = 5;
+  VM_S.pNewer[0] = 0; VM_S.pOlder[0] = -1; VM_S.pIsPost[0] = 1; VM_S.pReadMin[0] = 2;
+  VM_S.postPids[0] = 0; VM_S.postPids[1] = 0; VM_S.pCid[0] = 0; VM_S.cardLen[0] = -1;
+  VM_S.curPostStart = 0; VM_S.curPostLen = 2; VM_S.cp = 2048; VM_S.cardLimit = 4096; VM_S.regVal[0] = 0;
+  const seedOps = Int32Array.from([
+    OP_LIT, 1024, 5, 0,
+    OP_LIT, 1024, 45, 0,
+    OP_STR, 0, 0, 0,
+    OP_STR, 1, 0, 0,
+    OP_STR, 2, 0, 0,
+    OP_INT, 0, 0, 0,
+    OP_BOOL, 0, 0, 0,
+    OP_JCOND, 0, 0, 32,
+    OP_JCOND, 1, (16 << 8) | 15, 36,
+    OP_JMP, 40, 0, 0,
+    OP_FOR_CARDS_INIT, 0, 1, 60,
+    OP_FOR_CARDS_CHECK, 0, 60, 0,
+    OP_LIT, 1024, 5, 0,
+    OP_STR, 0, 1, 0,
+    OP_FOR_CARDS_NEXT, 0, 44, 0,
+  ]);
+  KT_execVm(seedOps, seedOps.length, 4096, VM_S);
+  VM_S.cardLen[0] = -1; VM_S.pNewer[0] = -1; VM_S.pOlder[0] = -1;
+  VM_S.pendingCid = -1; VM_S.cp = 0; VM_S.cardLimit = 0;
+  VM_S.pReadMin[0] = 0; VM_S.pIsPost[0] = 0; VM_S.curPostLen = 0;
+
+  const fmSample = '---\ntitle: "a\\"b"\ndate: 2024-01-01\ntags: [a, b]\ndraft: false\nlayout: post\nslug: a\nsummary: s\n---\n';
+  const fmN = FM_BUF_B.utf8Write(fmSample, 0);
+  K_parseFm(FM_BUF, FM_BUF_B, 0, fmN);
+  FM_RES.title = ''; FM_RES.date = ''; FM_RES.summary = ''; FM_RES.layout = '';
+  FM_RES.slug = ''; FM_RES.draft = false; FM_RES.tags = null; FM_RES.err = ''; FM_RES.bodyStart = 0;
+}
+
 const OUT_RANGE = { start: 0, end: 0 };
 
 function runFile(inPath, outPath) {
+  seedFeedback();
   const fdIn = openSync(inPath, 'r');
   const rawLen = fstatSync(fdIn).size;
   ensureSlab(rawLen + 6 * 1024 * 1024, 0);
