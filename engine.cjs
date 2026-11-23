@@ -3089,7 +3089,7 @@ let FEEDBACK_SEEDED = false;
 function seedFeedback() {
   if (FEEDBACK_SEEDED) return;
   FEEDBACK_SEEDED = true;
-  const sample = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa **a *b* c** *d **e** f* *x `c` `y \\* \\> \\\\ & [t](https://a) [u';
+  const sample = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa **a *b* \\* c** *d **e** f* **y *x `c` `y \\* \\> \\\\ & [t](https://a) [u';
   const n = SLAB_BUF.utf8Write(sample, 0);
   const np = PARA_BUF_B.utf8Write(sample, 0);
   const dummyCtx = { dir: '', upPrefix: [''], dirParts: [], bySource: new Map(), staticSet: new Set(), broken: new Set(), base: '', srcPath: '', uCache: null };
@@ -3145,6 +3145,7 @@ function seedFeedback() {
     dummyHp.hp = 512;
     KT_mdInline(SLAB, 0, n, 256, dummyCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
     KT_mdInline(PARA_BUF, 0, np, 512, dummyCtx, MD_LUT, HJ_FLAT, ESCAPABLE_CC);
+    KT_writeFieldH('', VM_S.pOff, VM_S.pLen, 0, dummyHp, HJ_LEN);
     KT_writeFieldH('abc', VM_S.pOff, VM_S.pLen, 0, dummyHp, HJ_LEN);
     KT_writeFieldH('a&é', VM_S.pOff, VM_S.pLen, 1, dummyHp, HJ_LEN);
     VM_S.pOff[0] = 1024; VM_S.pLen[0] = 45;
