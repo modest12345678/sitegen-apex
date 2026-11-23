@@ -1,4 +1,4 @@
-import { createRequire } from 'node:module';
+'use strict';
 
-const req = createRequire(import.meta.url);
-export const { run } = req('./engine.cjs');
+const { run } = require('./engine.cjs');
+exports.run = run;

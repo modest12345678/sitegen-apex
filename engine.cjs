@@ -677,7 +677,7 @@ function writeResolvedHref(src, hs, he, remEnd, p, ctx) {
   return SCAN_P[0];
 }
 
-// Single-pass Byte-Native Inline Markdown using K_scanEsc.
+// Slim freq-ordered inline Markdown renderer using K_scanEsc (*, `, [, \).
 function mdInline(src, s, e, p, ctx) {
   let i = s | 0;
   const end = e | 0;
@@ -690,40 +690,6 @@ function mdInline(src, s, e, p, ctx) {
     let dst = SLAB;
     curSrc = srcIsSlab ? dst : src;
     const ch = curSrc[i];
-    if (ch === 92) {
-      if (i + 1 < end) {
-        const nc = curSrc[i + 1];
-        if (ESCAPABLE_CC[nc] === 1) {
-          if (nc === 62) {
-            dst[p++] = 38; dst[p++] = 103; dst[p++] = 116; dst[p++] = 59; // &gt;
-          } else if (nc === 92) {
-            dst[p++] = 92; dst[p++] = 92; // \\
-          } else {
-            dst[p++] = nc;
-          }
-          i += 2;
-          continue;
-        }
-      }
-      dst[p++] = 92; dst[p++] = 92; // \\
-      i++;
-      continue;
-    }
-    if (ch === 96) {
-      let j = i + 1;
-      while (j < end && curSrc[j] !== 96) j++;
-      if (j < end && j > i + 1) {
-        dst[p++] = 60; dst[p++] = 99; dst[p++] = 111; dst[p++] = 100; dst[p++] = 101; dst[p++] = 62; // <code>
-        K_scanEsc(curSrc, i + 1, j, dst, p, HJ_LEN, HJ_FLAT);
-        p = SCAN_P[0];
-        dst[p++] = 60; dst[p++] = 47; dst[p++] = 99; dst[p++] = 111; dst[p++] = 100; dst[p++] = 101; dst[p++] = 62; // </code>
-        i = j + 1;
-      } else {
-        dst[p++] = 96;
-        i++;
-      }
-      continue;
-    }
     if (ch === 42) {
       if (i + 1 < end && curSrc[i + 1] === 42) {
         const j = findUnescapedDStarBuf(curSrc, i + 2, end);
@@ -752,24 +718,58 @@ function mdInline(src, s, e, p, ctx) {
       }
       continue;
     }
-    // ch === 91 '['
-    const k = findUnescapedCharBuf(curSrc, 93, i + 1, end);
-    if (k !== -1 && k + 1 < end && curSrc[k + 1] === 40) {
-      let m = k + 2;
-      while (m < end && curSrc[m] !== 41) m++;
-      if (m < end && m > k + 2 && !hasBufWhitespace(curSrc, k + 2, m)) {
-        dst[p++] = 60; dst[p++] = 97; dst[p++] = 32; dst[p++] = 104; dst[p++] = 114; dst[p++] = 101; dst[p++] = 102; dst[p++] = 61; dst[p++] = 92; dst[p++] = 34; // <a href=\"
-        p = writeResolvedHref(curSrc, k + 2, m, end - m, p, ctx);
-        dst = SLAB;
-        dst[p++] = 92; dst[p++] = 34; dst[p++] = 62; // \">
-        p = mdInline(srcIsSlab ? dst : curSrc, i + 1, k, p, ctx);
-        dst = SLAB;
-        dst[p++] = 60; dst[p++] = 47; dst[p++] = 97; dst[p++] = 62; // </a>
-        i = m + 1;
+    if (ch === 96) {
+      let j = i + 1;
+      while (j < end && curSrc[j] !== 96) j++;
+      if (j < end && j > i + 1) {
+        dst[p++] = 60; dst[p++] = 99; dst[p++] = 111; dst[p++] = 100; dst[p++] = 101; dst[p++] = 62; // <code>
+        K_scanEsc(curSrc, i + 1, j, dst, p, HJ_LEN, HJ_FLAT);
+        p = SCAN_P[0];
+        dst[p++] = 60; dst[p++] = 47; dst[p++] = 99; dst[p++] = 111; dst[p++] = 100; dst[p++] = 101; dst[p++] = 62; // </code>
+        i = j + 1;
+      } else {
+        dst[p++] = 96;
+        i++;
+      }
+      continue;
+    }
+    if (ch === 91) {
+      const k = findUnescapedCharBuf(curSrc, 93, i + 1, end);
+      if (k !== -1 && k + 1 < end && curSrc[k + 1] === 40) {
+        let m = k + 2;
+        while (m < end && curSrc[m] !== 41) m++;
+        if (m < end && m > k + 2 && !hasBufWhitespace(curSrc, k + 2, m)) {
+          dst[p++] = 60; dst[p++] = 97; dst[p++] = 32; dst[p++] = 104; dst[p++] = 114; dst[p++] = 101; dst[p++] = 102; dst[p++] = 61; dst[p++] = 92; dst[p++] = 34; // <a href=\"
+          p = writeResolvedHref(curSrc, k + 2, m, end - m, p, ctx);
+          dst = SLAB;
+          dst[p++] = 92; dst[p++] = 34; dst[p++] = 62; // \">
+          p = mdInline(srcIsSlab ? dst : curSrc, i + 1, k, p, ctx);
+          dst = SLAB;
+          dst[p++] = 60; dst[p++] = 47; dst[p++] = 97; dst[p++] = 62; // </a>
+          i = m + 1;
+          continue;
+        }
+      }
+      dst[p++] = 91;
+      i++;
+      continue;
+    }
+    // ch === 92 '\\'
+    if (i + 1 < end) {
+      const nc = curSrc[i + 1];
+      if (ESCAPABLE_CC[nc] === 1) {
+        if (nc === 62) {
+          dst[p++] = 38; dst[p++] = 103; dst[p++] = 116; dst[p++] = 59; // &gt;
+        } else if (nc === 92) {
+          dst[p++] = 92; dst[p++] = 92; // \\
+        } else {
+          dst[p++] = nc;
+        }
+        i += 2;
         continue;
       }
     }
-    dst[p++] = 91;
+    dst[p++] = 92; dst[p++] = 92; // \\
     i++;
   }
   return p;
@@ -1233,7 +1233,7 @@ function fmBufEq(buf, s, e, lit) {
 const KEY_NAMES = ['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary'];
 const FM_RES = { title: '', date: '', summary: '', layout: '', slug: '', draft: false, tags: null, err: '', bodyStart: 0 };
 
-function parseFrontMatterBuf(buf, bufB, basePos, endLimit) {
+function parseFrontMatterBuf(buf, bufB, basePos, endLimit, knownClosePos = -1) {
   const len = endLimit;
   const fm = FM_RES;
   let nl = basePos;
@@ -1243,20 +1243,26 @@ function parseFrontMatterBuf(buf, bufB, basePos, endLimit) {
     return false;
   }
   const bodyFmStart = nl + 1;
-  let pos = bodyFmStart;
-  let closePos = -1;
+  let pos;
+  let closePos;
   let bodyStart = len;
-  while (pos < len) {
-    nl = pos;
-    while (nl < len && buf[nl] !== 10) nl++;
-    if (nl - pos === 3 && buf[pos] === 45 && buf[pos + 1] === 45 && buf[pos + 2] === 45) {
-      closePos = pos;
-      bodyStart = nl < len ? nl + 1 : len;
-      break;
+  if (knownClosePos >= 0) {
+    closePos = knownClosePos;
+  } else {
+    pos = bodyFmStart;
+    closePos = -1;
+    while (pos < len) {
+      nl = pos;
+      while (nl < len && buf[nl] !== 10) nl++;
+      if (nl - pos === 3 && buf[pos] === 45 && buf[pos + 1] === 45 && buf[pos + 2] === 45) {
+        closePos = pos;
+        bodyStart = nl < len ? nl + 1 : len;
+        break;
+      }
+      pos = nl + 1;
     }
-    pos = nl + 1;
+    if (closePos === -1) { fm.err = 'the front matter is not closed'; return false; }
   }
-  if (closePos === -1) { fm.err = 'the front matter is not closed'; return false; }
 
   fm.title = ''; fm.date = ''; fm.summary = ''; fm.layout = ''; fm.slug = ''; fm.draft = false; fm.tags = null;
   let seenMask = 0;
@@ -1340,18 +1346,49 @@ function parseFrontMatterBuf(buf, bufB, basePos, endLimit) {
         fm.slug = bufB.toString('latin1', vs, ve);
       } else {
         if (buf[vs] !== 91 || buf[ve - 1] !== 93) { fm.err = 'key "tags": not a list [a, b]'; return false; }
-        const rawT = bufB.toString('utf8', vs + 1, ve - 1);
-        if (rawT.trim() === '') fm.tags = [];
-        else {
-          const tags = rawT.split(',').map((t) => t.trim());
-          for (let ti = 0; ti < tags.length; ti++) {
-            const tg = tags[ti];
-            if (tg === '' || tg.includes('"') || tg.includes('[') || tg.includes(']')) {
+        let ls = vs + 1;
+        const le = ve - 1;
+        while (ls < le && (buf[ls] === 32 || (buf[ls] >= 9 && buf[ls] <= 13))) ls++;
+        let leT = le;
+        while (leT > ls && (buf[leT - 1] === 32 || (buf[leT - 1] >= 9 && buf[leT - 1] <= 13))) leT--;
+        if (ls >= leT) {
+          fm.tags = [];
+        } else {
+          const tags = [];
+          let tp = ls;
+          let sawComma = false;
+          while (tp <= leT) {
+            let cPos = tp;
+            let segEnd = leT;
+            while (cPos < leT) {
+              const b = buf[cPos];
+              if (b === 44) { segEnd = cPos; sawComma = true; break; }
+              if (b === 34 || b === 91 || b === 93) {
+                fm.err = 'key "tags": an empty tag, or one holding " [ or ]';
+                return false;
+              }
+              cPos++;
+            }
+            let ts = tp, te = segEnd;
+            while (ts < te && (buf[ts] === 32 || (buf[ts] >= 9 && buf[ts] <= 13))) ts++;
+            while (te > ts && (buf[te - 1] === 32 || (buf[te - 1] >= 9 && buf[te - 1] <= 13))) te--;
+            let tg;
+            if (ts >= te) {
+              tg = '';
+            } else if (buf[ts] >= 128 || buf[te - 1] >= 128) {
+              tg = bufB.toString('utf8', ts, te).trim();
+            } else {
+              tg = bufB.toString('utf8', ts, te);
+            }
+            if (tg === '') {
+              if (!sawComma && cPos === leT) { fm.tags = []; break; }
               fm.err = 'key "tags": an empty tag, or one holding " [ or ]';
               return false;
             }
+            tags.push(tg);
+            if (cPos >= leT) { fm.tags = tags; break; }
+            tp = segEnd + 1;
           }
-          fm.tags = tags;
         }
       }
     }
@@ -2356,8 +2393,8 @@ function cachedSlug(name, slugCache, uCache) {
   return sl;
 }
 
-function openKv(kStr, op, writtenKeys, sepByte) {
-  writtenKeys.add(kStr);
+function openKv(kStr, op, sepByte, staticHtmlSet, shadowedSet) {
+  if (staticHtmlSet !== null && staticHtmlSet.has(kStr)) shadowedSet.add(kStr);
   const kn = kStr.length;
   const need = op + kn * 6 + 16;
   const outB = need > SLAB.length ? ensureSlab(need, op) : SLAB;
@@ -2376,6 +2413,34 @@ function openKv(kStr, op, writtenKeys, sepByte) {
   }
   if (op + 4 > SLAB.length) ensureSlab(op + 4, op);
   SLAB[op++] = 34; SLAB[op++] = 58; SLAB[op++] = 34; // ":"
+  return op;
+}
+
+function openKvPage(outDir, op, sepByte, staticHtmlSet, shadowedSet) {
+  if (staticHtmlSet !== null) {
+    const full = outDir + '/index.html';
+    if (staticHtmlSet.has(full)) shadowedSet.add(full);
+  }
+  const kn = outDir.length;
+  const need = op + kn * 6 + 32;
+  let outB = need > SLAB.length ? ensureSlab(need, op) : SLAB;
+  outB[op++] = sepByte;
+  outB[op++] = 34;
+  let asciiFast = true;
+  for (let k = 0; k < kn; k++) {
+    const c = outDir.charCodeAt(k);
+    if (c < 32 || c > 126 || c === 34 || c === 92) { asciiFast = false; break; }
+    outB[op + k] = c;
+  }
+  if (asciiFast) {
+    op += kn;
+  } else {
+    op = writeOutEscJsonStr(outDir, op);
+    outB = op + 20 > SLAB.length ? ensureSlab(op + 20, op) : SLAB;
+  }
+  outB[op++] = 47; outB[op++] = 105; outB[op++] = 110; outB[op++] = 100; outB[op++] = 101; outB[op++] = 120;
+  outB[op++] = 46; outB[op++] = 104; outB[op++] = 116; outB[op++] = 109; outB[op++] = 108;
+  outB[op++] = 34; outB[op++] = 58; outB[op++] = 34; // /index.html":"
   return op;
 }
 
@@ -2512,7 +2577,7 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
       const fmLen = unescSmall(SLAB, src.rawS, fmRawEnd, fmDst, UNESC_TBL);
       if (fmLen !== -1) {
         usedFmFirst = true;
-        if (!parseFrontMatterBuf(fmDst, FM_BUF_B, 0, fmLen)) {
+        if (!parseFrontMatterBuf(fmDst, FM_BUF_B, 0, fmLen, fmLen - 3)) {
           report.push(`refused ${src.path}: ${fm.err}`);
           continue;
         }
@@ -2836,14 +2901,22 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
   if (prefixByte !== 0) SLAB[outBase - 1] = prefixByte;
   let op = outBase;
 
-  const writtenKeys = new Set();
+  let staticHtmlSet = null;
+  let shadowedSet = null;
+  for (let i = 0; i < statics.length; i++) {
+    const p = statics[i].path;
+    if (p.endsWith('.html')) {
+      if (staticHtmlSet === null) { staticHtmlSet = new Set(); shadowedSet = new Set(); }
+      staticHtmlSet.add(p);
+    }
+  }
   let sep = 123; // '{' on first entry, ',' afterwards
 
   // Render pages
   for (let i = 0; i < kept.length; i++) {
     const it = kept[i];
     const comp = pageTplByLayout.get(it.layout);
-    op = openKv(`${it.outDir}/index.html`, op, writtenKeys, sep); sep = 44;
+    op = openKvPage(it.outDir, op, sep, staticHtmlSet, shadowedSet); sep = 44;
     if (!comp.needsDynScope) {
       S.regVal[0] = it.pid;
       op = execVm(comp.ops, comp.nWords, op, S);
@@ -2862,7 +2935,7 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
       const oUrl = k === pages ? '' : `${base}/page/${k + 1}/`;
       const start = (k - 1) * per;
       const cnt = Math.max(0, Math.min(posts.length, k * per) - start);
-      op = openKv(k === 1 ? 'index.html' : `page/${k}/index.html`, op, writtenKeys, sep); sep = 44;
+      op = openKv(k === 1 ? 'index.html' : `page/${k}/index.html`, op, sep, staticHtmlSet, shadowedSet); sep = 44;
       if (!indexComp.needsDynScope) {
         pagerHpBox.hp = pagerBase;
         writeSlotFieldH(url, S.pgOff, S.pgLen, 0, pagerHpBox);
@@ -2885,7 +2958,7 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
   if (tagComp !== null) {
     for (let i = 0; i < realTags.length; i++) {
       const tp = realTags[i];
-      op = openKv(`tags/${tp.slug}/index.html`, op, writtenKeys, sep); sep = 44;
+      op = openKv(`tags/${tp.slug}/index.html`, op, sep, staticHtmlSet, shadowedSet); sep = 44;
       if (!tagComp.needsDynScope) {
         S.regVal[0] = tp.tid;
         op = execVm(tagComp.ops, tagComp.nWords, op, S);
@@ -2900,7 +2973,7 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
 
   // Render tags index
   if (tagsComp !== null) {
-    op = openKv('tags/index.html', op, writtenKeys, sep); sep = 44;
+    op = openKv('tags/index.html', op, sep, staticHtmlSet, shadowedSet); sep = 44;
     if (!tagsComp.needsDynScope) {
       op = execVm(tagsComp.ops, tagsComp.nWords, op, S);
     } else {
@@ -2910,14 +2983,16 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
   }
 
   // Render static files (ZERO-COPY inside SLAB!)
+  const seenStatic = statics.length > 1 ? new Set() : null;
   for (let i = 0; i < statics.length; i++) {
     const f = statics[i];
-    if (writtenKeys.has(f.path)) {
+    if ((shadowedSet !== null && shadowedSet.has(f.path)) || (seenStatic !== null && seenStatic.has(f.path))) {
       report.push(`shadowed ${f.path}: a built page has its path`);
       continue;
     }
+    if (seenStatic !== null) seenStatic.add(f.path);
     if (f.path === 'build-report.txt') continue;
-    op = openKv(f.path, op, writtenKeys, sep); sep = 44;
+    op = openKv(f.path, op, sep, null, null); sep = 44;
     if (rawLen > 0) {
       const rLen = f.rawE - f.rawS;
       if (op + rLen + 16 > SLAB.length) ensureSlab(op + rLen + 16, op);
@@ -2932,7 +3007,7 @@ function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, ou
   // Build report
   const rLines = [...report, ...broken].sort(byCodeUnits);
   rLines.push(`built ${kept.length - posts.length} pages, ${posts.length} posts, ${realTags.length} tags and ${statics.length} static files`);
-  op = openKv('build-report.txt', op, writtenKeys, sep);
+  op = openKv('build-report.txt', op, sep, null, null);
   op = writeOutEscJsonStr(`${rLines.join('\n')}\n`, op);
   op = closeKv(op);
 

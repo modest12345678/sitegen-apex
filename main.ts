@@ -1,5 +1,5 @@
 require('node:v8').setFlagsFromString(
-  '--no-incremental-marking --no-turbofan --invocation-count-for-maglev=1800 --invocation-count-for-maglev-osr=1800 --no-concurrent-recompilation --no-concurrent-marking --no-concurrent-sweeping'
+  '--no-incremental-marking --no-turbofan --invocation-count-for-maglev=800 --invocation-count-for-maglev-osr=800 --no-concurrent-recompilation --no-concurrent-marking --no-concurrent-sweeping --no-concurrent-osr --no-maglev-build-code-on-background --no-maglev-deopt-data-on-background --no-maglev-destroy-on-background'
 );
 
 const IN = process.env.MAKEFUN_INPUT_DIR ?? '/input';
