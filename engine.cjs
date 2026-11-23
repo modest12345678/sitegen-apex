@@ -1,64 +1,61 @@
-// sitegen-apex v6: Zero-ESM CJS + Raw-UTF8 Byte Streaming + Zero-Deopt K_* Kernels + Flat Bytecode VM
+// sitegen-apex v8: Unified CopyWithin Slab + Frontmatter-First Skip + Branchless 4x WordCount + Flat Bytecode VM
 'use strict';
 
-const { openSync, closeSync, readFileSync, writeSync } = require('node:fs');
+const { openSync, closeSync, fstatSync, readSync, writeSync } = require('node:fs');
 
 // ---------------------------------------------------------------------------
-// Reusable Pre-Allocated Slabs (reset offsets per case; grow on demand)
+// Unified Pre-Allocated CopyWithin Slab (SLAB + SLAB_BUF share ArrayBuffer)
+// Layout in runFile(): [0..rawLen) raw cases.json | [rawLen..bodyEnd) bodies |
+// [bodyEnd..pagerBase) HTML/templates | [pagerBase..cardBase) pager scratch |
+// [cardBase..outBase) cached post cards | [outBase..) JSON output stream
 // ---------------------------------------------------------------------------
-let BODY_SLAB = Buffer.allocUnsafe(4 * 1024 * 1024);
-let PARA_BUF = Buffer.allocUnsafe(128 * 1024);
-let LINK_BUF = Buffer.allocUnsafe(16 * 1024);
-let HBUF = Buffer.allocUnsafe(8 * 1024 * 1024);
-let CARD_SLAB = Buffer.allocUnsafe(2 * 1024 * 1024);
-let OUT_SLAB = Buffer.allocUnsafe(8 * 1024 * 1024);
+let SLAB = new Uint8Array(12 * 1024 * 1024);
+let SLAB_BUF = Buffer.from(SLAB.buffer);
 
-function growCap(cur, need) {
-  let cap = cur;
+function ensureSlab(need, used) {
+  if (need <= SLAB.length) return SLAB;
+  let cap = SLAB.length;
   while (cap < need) cap *= 2;
-  return Buffer.allocUnsafe(cap);
+  const next = new Uint8Array(cap);
+  if (used > 0) next.set(SLAB.subarray(0, used));
+  SLAB = next;
+  SLAB_BUF = Buffer.from(next.buffer);
+  return SLAB;
 }
 
-function ensureBodySlab(need, curBp) {
-  if (need <= BODY_SLAB.length) return BODY_SLAB;
-  const next = growCap(BODY_SLAB.length, need);
-  if (curBp > 0) BODY_SLAB.copy(next, 0, 0, curBp);
-  BODY_SLAB = next;
-  return BODY_SLAB;
-}
-
-function ensureParaBuf(need) {
-  if (need > PARA_BUF.length) PARA_BUF = growCap(PARA_BUF.length, need);
+let PARA_BUF = new Uint8Array(64 * 1024);
+let PARA_BUF_B = Buffer.from(PARA_BUF.buffer);
+function ensureParaBuf(need, curLen) {
+  if (need <= PARA_BUF.length) return PARA_BUF;
+  let cap = PARA_BUF.length;
+  while (cap < need) cap *= 2;
+  const next = new Uint8Array(cap);
+  if (curLen > 0) next.set(PARA_BUF.subarray(0, curLen));
+  PARA_BUF = next;
+  PARA_BUF_B = Buffer.from(next.buffer);
   return PARA_BUF;
 }
 
+let FM_BUF = new Uint8Array(8 * 1024);
+let FM_BUF_B = Buffer.from(FM_BUF.buffer);
+function ensureFmBuf(need) {
+  if (need <= FM_BUF.length) return FM_BUF;
+  let cap = FM_BUF.length;
+  while (cap < need) cap *= 2;
+  FM_BUF = new Uint8Array(cap);
+  FM_BUF_B = Buffer.from(FM_BUF.buffer);
+  return FM_BUF;
+}
+
+let LINK_BUF = new Uint8Array(8 * 1024);
+let LINK_BUF_B = Buffer.from(LINK_BUF.buffer);
 function ensureLinkBuf(need) {
-  if (need > LINK_BUF.length) LINK_BUF = growCap(LINK_BUF.length, need);
+  if (need <= LINK_BUF.length) return LINK_BUF;
+  let cap = LINK_BUF.length;
+  while (cap < need) cap *= 2;
+  LINK_BUF = new Uint8Array(cap);
+  LINK_BUF_B = Buffer.from(LINK_BUF.buffer);
   return LINK_BUF;
-}
-
-function ensureHBuf(need, curP) {
-  if (need <= HBUF.length) return HBUF;
-  const next = growCap(HBUF.length, need);
-  if (curP > 0) HBUF.copy(next, 0, 0, curP);
-  HBUF = next;
-  return HBUF;
-}
-
-function ensureCardSlab(need, curCp) {
-  if (need <= CARD_SLAB.length) return CARD_SLAB;
-  const next = growCap(CARD_SLAB.length, need);
-  if (curCp > 0) CARD_SLAB.copy(next, 0, 0, curCp);
-  CARD_SLAB = next;
-  return CARD_SLAB;
-}
-
-function ensureOutSlab(need, curOp) {
-  if (need <= OUT_SLAB.length) return OUT_SLAB;
-  const next = growCap(OUT_SLAB.length, need);
-  if (curOp > 0) OUT_SLAB.copy(next, 0, 0, curOp);
-  OUT_SLAB = next;
-  return OUT_SLAB;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +113,17 @@ for (const ch of '\\`*_[]()#+-!>.') ESCAPABLE_CC[ch.charCodeAt(0)] = 1;
 
 const WS_TBL = new Uint8Array(256);
 WS_TBL[9] = 1; WS_TBL[10] = 1; WS_TBL[11] = 1; WS_TBL[12] = 1; WS_TBL[13] = 1; WS_TBL[32] = 1;
+
+// Branchless 4x word-count class: 0 = ASCII WS, 1 = ASCII/UTF8 non-WS, 2 = Unicode WS lead byte
+const W_CLS = new Uint8Array(256);
+W_CLS.fill(1);
+W_CLS[9] = 0; W_CLS[10] = 0; W_CLS[11] = 0; W_CLS[12] = 0; W_CLS[13] = 0; W_CLS[32] = 0;
+W_CLS[0xC2] = 2; W_CLS[0xE1] = 2; W_CLS[0xE2] = 2; W_CLS[0xE3] = 2; W_CLS[0xEF] = 2;
+
+const BLK_START = new Uint8Array(256);
+BLK_START[9] = 1; BLK_START[32] = 1; BLK_START[35] = 1; BLK_START[42] = 1;
+BLK_START[45] = 1; BLK_START[62] = 1; BLK_START[96] = 1;
+for (let c = 48; c <= 57; c++) BLK_START[c] = 1;
 
 const SLUG_TBL = new Uint8Array(256);
 for (let c = 48; c <= 57; c++) SLUG_TBL[c] = c;
@@ -197,10 +205,10 @@ function nonAsciiWsStep(buf, i, end) {
   return -(i + 1);
 }
 
-function slugifyStr(text) {
+function slugifyStr(text, uCache = null) {
   const n = text.length;
   for (let i = 0; i < n; i++) {
-    if (text.charCodeAt(i) >= 128) return slugifyUnicode(text);
+    if (text.charCodeAt(i) >= 128) return slugifyUnicode(text, uCache);
   }
   let outLen = 0;
   let gap = false;
@@ -223,9 +231,12 @@ function slugifyStr(text) {
   return outLen === 0 ? 'untitled' : SLUG_SCRATCH.toString('latin1', 0, outLen);
 }
 
-function slugifyBuf(buf, s, e) {
+function slugifyBuf(buf, s, e, uCache = null) {
   for (let i = s; i < e; i++) {
-    if (buf[i] >= 128) return slugifyUnicode(buf.toString('utf8', s, e));
+    if (buf[i] >= 128) {
+      const b = buf === SLAB ? SLAB_BUF : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+      return slugifyUnicode(b.toString('utf8', s, e), uCache);
+    }
   }
   let outLen = 0;
   let gap = false;
@@ -248,24 +259,35 @@ function slugifyBuf(buf, s, e) {
   return outLen === 0 ? 'untitled' : SLUG_SCRATCH.toString('latin1', 0, outLen);
 }
 
-function slugifyUnicode(text) {
+function slugifyUnicode(text, uCache) {
+  if (uCache !== null) {
+    const hit = uCache.get(text);
+    if (hit !== undefined) return hit;
+  }
   const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
-  let out = '';
+  let outLen = 0;
   let gap = false;
-  for (const ch of plain) {
-    let keep = null;
-    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-    if (keep === null) {
-      gap = out.length > 0;
+  const n = plain.length;
+  for (let i = 0; i < n; i++) {
+    const c = plain.charCodeAt(i);
+    const mapped = c < 128 ? SLUG_TBL[c] : 0;
+    if (mapped === 0) {
+      gap = outLen > 0;
       continue;
     }
-    if (gap) out += '-';
-    gap = false;
-    out += keep;
+    if (gap) {
+      if (outLen === SLUG_MAX) break;
+      SLUG_SCRATCH[outLen++] = 45;
+      gap = false;
+      if (outLen === SLUG_MAX) break;
+    }
+    SLUG_SCRATCH[outLen++] = mapped;
+    if (outLen === SLUG_MAX) break;
   }
-  out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
-  return out === '' ? 'untitled' : out;
+  while (outLen > 0 && SLUG_SCRATCH[outLen - 1] === 45) outLen--;
+  const res = outLen === 0 ? 'untitled' : SLUG_SCRATCH.toString('latin1', 0, outLen);
+  if (uCache !== null) uCache.set(text, res);
+  return res;
 }
 
 function uniqueSlug(slug, taken) {
@@ -321,18 +343,54 @@ function truthy(v) {
 }
 
 // ---------------------------------------------------------------------------
-// Zero-Deopt Selective TurboFan K_* Kernels
+// Core Byte Kernels (Latin1 SIMD + CopyWithin Slab + Branchless 4x WordCount)
 // ---------------------------------------------------------------------------
 
-// K1: Unescape a JSON string span [s..e) into dst[0..], normalizing \r\n and \r -> \n.
-// Returns unescaped byte length, or -1 if a \uXXXX or unrecognized escape is hit.
-function K_unescMd(src, s, e, dst, dp, tbl) {
+// Unescape JSON string [s..e) into slab[dp..], normalizing \r\n and \r -> \n.
+// Uses latin1 indexOf('\\') + copyWithin; returns -1 on \uXXXX or unknown escape.
+function K_unescIdxOfCW(slab, lat, s, e, dp, tbl) {
   let i = s | 0;
   let p = dp | 0;
   const end = e | 0;
   while (i < end) {
+    const bs = lat.indexOf('\\', i);
+    const segEnd = (bs === -1 || bs >= end) ? end : bs;
+    const n = segEnd - i;
+    if (n > 0) {
+      if (n <= 40) {
+        for (let k = i; k < segEnd; k++) slab[p++] = slab[k];
+      } else {
+        slab.copyWithin(p, i, segEnd);
+        p += n;
+      }
+    }
+    if (segEnd >= end) break;
+    if (segEnd + 1 >= end) return -1;
+    const c = slab[segEnd + 1];
+    const m = tbl[c];
+    if (m !== 0) {
+      slab[p++] = m;
+      i = segEnd + 2;
+    } else if (c === 114) {
+      slab[p++] = 10;
+      i = segEnd + 2;
+      if (i + 1 < end && slab[i] === 92 && slab[i + 1] === 110) i += 2;
+    } else {
+      return -1;
+    }
+  }
+  return p - dp;
+}
+
+// Small separate-buffer unescape for frontmatter [s..e) into FM_BUF[0..].
+function unescSmall(src, s, e, dst, tbl) {
+  let i = s | 0;
+  let p = 0;
+  const end = e | 0;
+  while (i < end) {
     const b = src[i];
     if (b === 92) {
+      if (i + 1 >= end) return -1;
       const c = src[i + 1];
       const m = tbl[c];
       if (m !== 0) {
@@ -350,7 +408,56 @@ function K_unescMd(src, s, e, dst, dp, tbl) {
       i++;
     }
   }
-  return p - dp;
+  return p;
+}
+
+let FM_RAW_BODY_S = 0;
+// Locate closing '---' of frontmatter directly in JSON-escaped raw SLAB (only when !hasAnyU).
+// Returns fmRawEnd (>= 0) and sets FM_RAW_BODY_S, or -2 (no front matter), or -3 (not closed).
+function findRawFmEnd(slab, lat, rawS, rawE) {
+  const rLen = rawE - rawS;
+  if (rLen < 3 || slab[rawS] !== 45 || slab[rawS + 1] !== 45 || slab[rawS + 2] !== 45) return -2;
+  let scan;
+  if (rLen === 3) return -3;
+  if (slab[rawS + 3] === 92 && rawS + 4 < rawE) {
+    const c1 = slab[rawS + 4];
+    if (c1 === 110) {
+      scan = rawS + 5;
+    } else if (c1 === 114) {
+      scan = (rawS + 6 < rawE && slab[rawS + 5] === 92 && slab[rawS + 6] === 110) ? rawS + 7 : rawS + 5;
+    } else {
+      return -2;
+    }
+  } else {
+    return -2;
+  }
+  let idx = lat.indexOf('---', scan);
+  while (idx !== -1 && idx + 3 <= rawE) {
+    if (idx >= rawS + 2 && slab[idx - 2] === 92 && (slab[idx - 1] === 110 || slab[idx - 1] === 114)) {
+      let bs = idx - 2;
+      while (bs >= rawS && slab[bs] === 92) bs--;
+      if (((idx - 2 - bs) & 1) === 1) {
+        const after = idx + 3;
+        if (after === rawE) {
+          FM_RAW_BODY_S = rawE;
+          return after;
+        }
+        if (slab[after] === 92 && after + 1 < rawE) {
+          const nc = slab[after + 1];
+          if (nc === 110) {
+            FM_RAW_BODY_S = after + 2;
+            return after;
+          }
+          if (nc === 114) {
+            FM_RAW_BODY_S = (after + 3 < rawE && slab[after + 2] === 92 && slab[after + 3] === 110) ? after + 4 : after + 2;
+            return after;
+          }
+        }
+      }
+    }
+    idx = lat.indexOf('---', idx + 1);
+  }
+  return -3;
 }
 
 // SIMD-assisted JSON string end finder on latin1 view.
@@ -365,28 +472,38 @@ function findStrEnd(lat, s) {
   return -1;
 }
 
-// K2: Count words in UTF-8 Buffer [s..e) matching JS String(/\S+/g) exact whitespace rules.
-function K_wordsU8(buf, s, e, wsTbl) {
+// Branchless 4x-unrolled UTF-8 word counter matching JS String(/\S+/g) exact rules.
+function K_words4(buf, s, e, cls) {
   let words = 0;
-  let inW = 0;
+  let prev = 0;
   let i = s | 0;
   const end = e | 0;
+  const end4 = end - 3;
   while (i < end) {
-    const c = buf[i];
-    if (c < 128) {
-      if (wsTbl[c] === 0) {
-        if (inW === 0) { words++; inW = 1; }
-      } else {
-        inW = 0;
-      }
+    while (i < end4) {
+      const t0 = cls[buf[i]];
+      const t1 = cls[buf[i + 1]];
+      const t2 = cls[buf[i + 2]];
+      const t3 = cls[buf[i + 3]];
+      if ((t0 | t1 | t2 | t3) >= 2) break;
+      words += (t0 & (prev ^ 1)) + (t1 & (t0 ^ 1)) + (t2 & (t1 ^ 1)) + (t3 & (t2 ^ 1));
+      prev = t3;
+      i += 4;
+    }
+    if (i >= end) break;
+    const t = cls[buf[i]];
+    if (t < 2) {
+      words += t & (prev ^ 1);
+      prev = t;
       i++;
     } else {
       const r = nonAsciiWsStep(buf, i, end);
       if (r > 0) {
-        inW = 0;
+        prev = 0;
         i = r;
       } else {
-        if (inW === 0) { words++; inW = 1; }
+        words += (prev ^ 1);
+        prev = 1;
         i = -r;
       }
     }
@@ -394,21 +511,25 @@ function K_wordsU8(buf, s, e, wsTbl) {
   return words;
 }
 
-// K3: 25-line zero-deopt fast scanner + HTML/JSON escaper (stops on lut[b]===1 for MD syntax).
+// Fast scanner + HTML/JSON escaper using copyWithin inside unified SLAB (stops on lut[b]===1).
 const SCAN_P = new Int32Array(1);
-function K_scanEsc(src, s, e, out, p, lut, flat) {
+function K_scanEsc(src, s, e, dst, p, lut, flat) {
   let i = s | 0;
   const end = e | 0;
   let op = p | 0;
+  const same = src === dst;
   while (i < end) {
     const st = i;
     while (i < end && lut[src[i]] === 0) i++;
     const n = i - st;
     if (n > 0) {
       if (n <= 40) {
-        for (let k = st; k < i; k++) out[op++] = src[k];
+        for (let k = st; k < i; k++) dst[op++] = src[k];
+      } else if (same) {
+        dst.copyWithin(op, st, i);
+        op += n;
       } else {
-        src.copy(out, op, st, i);
+        dst.set(src.subarray(st, i), op);
         op += n;
       }
     }
@@ -417,7 +538,7 @@ function K_scanEsc(src, s, e, out, p, lut, flat) {
     const code = lut[ch];
     if (code === 1) break;
     const off = ch << 3;
-    for (let k = 0; k < code; k++) out[op++] = flat[off + k];
+    for (let k = 0; k < code; k++) dst[op++] = flat[off + k];
     i++;
   }
   SCAN_P[0] = op;
@@ -486,24 +607,61 @@ function isSchemeBuf(src, a, b) {
 }
 
 function writeResolvedHref(src, hs, he, remEnd, p, ctx) {
+  const srcIsSlab = src === SLAB;
   const c0 = src[hs];
   if (c0 === 47 || c0 === 35 || isSchemeBuf(src, hs, he)) {
     const need = p + (he - hs) * 6 + remEnd * 6 + 65536;
-    if (need > HBUF.length) ensureHBuf(need, p);
-    K_scanEsc(src, hs, he, HBUF, p, HJ_LEN, HJ_FLAT);
+    if (need > SLAB.length) ensureSlab(need, p);
+    K_scanEsc(srcIsSlab ? SLAB : src, hs, he, SLAB, p, HJ_LEN, HJ_FLAT);
     return SCAN_P[0];
   }
-  const target = src.toString('utf8', hs, he);
-  let resolved;
+  const srcB = srcIsSlab ? SLAB_BUF : (src === PARA_BUF ? PARA_BUF_B : Buffer.from(src.buffer, src.byteOffset, src.byteLength));
+  const target = srcB.toString('utf8', hs, he);
   const hash = target.indexOf('#');
   const rel = hash === -1 ? target : target.slice(0, hash);
-  const frag = hash === -1 ? '' : target.slice(hash);
-  const out = rel === '' ? null : resolveRelPathParts(ctx.dirParts, rel);
+  let out = null;
+  if (rel !== '') {
+    let up = 0, rOff = 0;
+    const rn = rel.length;
+    while (rOff + 2 < rn && rel.charCodeAt(rOff) === 46 && rel.charCodeAt(rOff + 1) === 46 && rel.charCodeAt(rOff + 2) === 47) {
+      up++;
+      rOff += 3;
+    }
+    const upPre = ctx.upPrefix;
+    if (up < upPre.length && rOff < rn && rel.charCodeAt(rOff) !== 46 && rel.charCodeAt(rOff) !== 47 &&
+        rel.charCodeAt(rn - 1) !== 47 && rel.indexOf('/.', rOff) === -1 && rel.indexOf('//', rOff) === -1) {
+      out = upPre[up] + (rOff === 0 ? rel : rel.slice(rOff));
+    } else {
+      out = resolveRelPathParts(ctx.dirParts, rel);
+    }
+  }
+  let resolved;
   if (out !== null) {
     const hit = ctx.bySource.get(out);
-    if (hit !== undefined) resolved = hit.url + frag;
-    else if (ctx.staticSet.has(out)) resolved = ctx.base + '/' + out + frag;
-    else {
+    if (hit !== undefined) {
+      const pIdx = hit.pid * PF_STRIDE + 1;
+      const uOff = VM_S.pOff[pIdx];
+      const uLen = VM_S.pLen[pIdx];
+      const need = p + uLen + (he - hs) * 6 + remEnd * 6 + 65536;
+      if (need > SLAB.length) ensureSlab(need, p);
+      const sl = SLAB;
+      if (uLen <= 40) {
+        for (let k = 0; k < uLen; k++) sl[p++] = sl[uOff + k];
+      } else {
+        sl.copyWithin(p, uOff, uOff + uLen);
+        p += uLen;
+      }
+      if (hash !== -1) {
+        let hb = hs;
+        const curSrc = srcIsSlab ? sl : src;
+        while (hb < he && curSrc[hb] !== 35) hb++;
+        K_scanEsc(curSrc, hb, he, sl, p, HJ_LEN, HJ_FLAT);
+        p = SCAN_P[0];
+      }
+      return p;
+    } else if (ctx.staticSet.has(out)) {
+      resolved = ctx.base + '/' + out + (hash === -1 ? '' : target.slice(hash));
+    } else {
       ctx.broken.add('broken-link ' + ctx.srcPath + ' -> ' + target);
       resolved = target;
     }
@@ -512,10 +670,10 @@ function writeResolvedHref(src, hs, he, remEnd, p, ctx) {
     resolved = target;
   }
   const lb = ensureLinkBuf(resolved.length * 3 + 16);
-  const nb = lb.utf8Write(resolved, 0);
+  const nb = LINK_BUF_B.utf8Write(resolved, 0);
   const need = p + nb * 6 + remEnd * 6 + 65536;
-  if (need > HBUF.length) ensureHBuf(need, p);
-  K_scanEsc(lb, 0, nb, HBUF, p, HJ_LEN, HJ_FLAT);
+  if (need > SLAB.length) ensureSlab(need, p);
+  K_scanEsc(lb, 0, nb, SLAB, p, HJ_LEN, HJ_FLAT);
   return SCAN_P[0];
 }
 
@@ -523,15 +681,18 @@ function writeResolvedHref(src, hs, he, remEnd, p, ctx) {
 function mdInline(src, s, e, p, ctx) {
   let i = s | 0;
   const end = e | 0;
+  const srcIsSlab = src === SLAB;
   while (i < end) {
-    i = K_scanEsc(src, i, end, HBUF, p, MD_LUT, HJ_FLAT);
+    let curSrc = srcIsSlab ? SLAB : src;
+    i = K_scanEsc(curSrc, i, end, SLAB, p, MD_LUT, HJ_FLAT);
     p = SCAN_P[0];
     if (i >= end) break;
-    let dst = HBUF;
-    const ch = src[i];
+    let dst = SLAB;
+    curSrc = srcIsSlab ? dst : src;
+    const ch = curSrc[i];
     if (ch === 92) {
       if (i + 1 < end) {
-        const nc = src[i + 1];
+        const nc = curSrc[i + 1];
         if (ESCAPABLE_CC[nc] === 1) {
           if (nc === 62) {
             dst[p++] = 38; dst[p++] = 103; dst[p++] = 116; dst[p++] = 59; // &gt;
@@ -550,10 +711,10 @@ function mdInline(src, s, e, p, ctx) {
     }
     if (ch === 96) {
       let j = i + 1;
-      while (j < end && src[j] !== 96) j++;
+      while (j < end && curSrc[j] !== 96) j++;
       if (j < end && j > i + 1) {
         dst[p++] = 60; dst[p++] = 99; dst[p++] = 111; dst[p++] = 100; dst[p++] = 101; dst[p++] = 62; // <code>
-        K_scanEsc(src, i + 1, j, dst, p, HJ_LEN, HJ_FLAT);
+        K_scanEsc(curSrc, i + 1, j, dst, p, HJ_LEN, HJ_FLAT);
         p = SCAN_P[0];
         dst[p++] = 60; dst[p++] = 47; dst[p++] = 99; dst[p++] = 111; dst[p++] = 100; dst[p++] = 101; dst[p++] = 62; // </code>
         i = j + 1;
@@ -564,12 +725,12 @@ function mdInline(src, s, e, p, ctx) {
       continue;
     }
     if (ch === 42) {
-      if (i + 1 < end && src[i + 1] === 42) {
-        const j = findUnescapedDStarBuf(src, i + 2, end);
+      if (i + 1 < end && curSrc[i + 1] === 42) {
+        const j = findUnescapedDStarBuf(curSrc, i + 2, end);
         if (j > i + 2) {
           dst[p++] = 60; dst[p++] = 115; dst[p++] = 116; dst[p++] = 114; dst[p++] = 111; dst[p++] = 110; dst[p++] = 103; dst[p++] = 62; // <strong>
-          p = mdInline(src, i + 2, j, p, ctx);
-          dst = HBUF;
+          p = mdInline(curSrc, i + 2, j, p, ctx);
+          dst = SLAB;
           dst[p++] = 60; dst[p++] = 47; dst[p++] = 115; dst[p++] = 116; dst[p++] = 114; dst[p++] = 111; dst[p++] = 110; dst[p++] = 103; dst[p++] = 62; // </strong>
           i = j + 2;
         } else {
@@ -577,11 +738,11 @@ function mdInline(src, s, e, p, ctx) {
           i += 2;
         }
       } else {
-        const j = findSingleStarBuf(src, i + 1, end);
+        const j = findSingleStarBuf(curSrc, i + 1, end);
         if (j > i + 1) {
           dst[p++] = 60; dst[p++] = 101; dst[p++] = 109; dst[p++] = 62; // <em>
-          p = mdInline(src, i + 1, j, p, ctx);
-          dst = HBUF;
+          p = mdInline(curSrc, i + 1, j, p, ctx);
+          dst = SLAB;
           dst[p++] = 60; dst[p++] = 47; dst[p++] = 101; dst[p++] = 109; dst[p++] = 62; // </em>
           i = j + 1;
         } else {
@@ -592,17 +753,17 @@ function mdInline(src, s, e, p, ctx) {
       continue;
     }
     // ch === 91 '['
-    const k = findUnescapedCharBuf(src, 93, i + 1, end);
-    if (k !== -1 && k + 1 < end && src[k + 1] === 40) {
+    const k = findUnescapedCharBuf(curSrc, 93, i + 1, end);
+    if (k !== -1 && k + 1 < end && curSrc[k + 1] === 40) {
       let m = k + 2;
-      while (m < end && src[m] !== 41) m++;
-      if (m < end && m > k + 2 && !hasBufWhitespace(src, k + 2, m)) {
+      while (m < end && curSrc[m] !== 41) m++;
+      if (m < end && m > k + 2 && !hasBufWhitespace(curSrc, k + 2, m)) {
         dst[p++] = 60; dst[p++] = 97; dst[p++] = 32; dst[p++] = 104; dst[p++] = 114; dst[p++] = 101; dst[p++] = 102; dst[p++] = 61; dst[p++] = 92; dst[p++] = 34; // <a href=\"
-        p = writeResolvedHref(src, k + 2, m, end - m, p, ctx);
-        dst = HBUF;
+        p = writeResolvedHref(curSrc, k + 2, m, end - m, p, ctx);
+        dst = SLAB;
         dst[p++] = 92; dst[p++] = 34; dst[p++] = 62; // \">
-        p = mdInline(src, i + 1, k, p, ctx);
-        dst = HBUF;
+        p = mdInline(srcIsSlab ? dst : curSrc, i + 1, k, p, ctx);
+        dst = SLAB;
         dst[p++] = 60; dst[p++] = 47; dst[p++] = 97; dst[p++] = 62; // </a>
         i = m + 1;
         continue;
@@ -617,12 +778,12 @@ function mdInline(src, s, e, p, ctx) {
 function writeOutEscJsonStr(str, op) {
   const escaped = escJsonStr(str);
   const maxB = escaped.length * 3 + 16;
-  const dst = op + maxB > OUT_SLAB.length ? ensureOutSlab(op + maxB, op) : OUT_SLAB;
-  return op + dst.utf8Write(escaped, op);
+  if (op + maxB > SLAB.length) ensureSlab(op + maxB, op);
+  return op + SLAB_BUF.utf8Write(escaped, op);
 }
 
 function writeOutUint(n, op) {
-  const dst = op + 16 > OUT_SLAB.length ? ensureOutSlab(op + 16, op) : OUT_SLAB;
+  const dst = op + 16 > SLAB.length ? ensureSlab(op + 16, op) : SLAB;
   if (n === 0) { dst[op++] = 48; return op; }
   let v = n | 0;
   let len = 0;
@@ -694,6 +855,7 @@ const VM_S = {
   cardStartOp: -1,
   pendingCid: -1,
   cp: 0,
+  cardLimit: 0,
 };
 
 function ensurePageCap(n) {
@@ -822,9 +984,8 @@ function vmElemAt(S, arrKind, pos) {
 
 function execVm(ops, nWords, op, S) {
   let ip = 0;
-  let dst = OUT_SLAB;
-  let dstCap = dst.length;
-  const h = HBUF;
+  let sl = SLAB;
+  let slCap = sl.length;
   while (ip < nWords) {
     const code = ops[ip];
     const a1 = ops[ip + 1];
@@ -833,12 +994,12 @@ function execVm(ops, nWords, op, S) {
     ip += 4;
     if (code === OP_LIT) {
       if (a2 > 0) {
-        if (op + a2 + 64 > dstCap) { dst = ensureOutSlab(op + a2 + 64, op); dstCap = dst.length; }
+        if (op + a2 + 64 > slCap) { sl = ensureSlab(op + a2 + 64, op); slCap = sl.length; }
         if (a2 <= 40) {
           const end = a1 + a2;
-          for (let k = a1; k < end; k++) dst[op++] = h[k];
+          for (let k = a1; k < end; k++) sl[op++] = sl[k];
         } else {
-          h.copy(dst, op, a1, a1 + a2);
+          sl.copyWithin(op, a1, a1 + a2);
           op += a2;
         }
       }
@@ -864,12 +1025,12 @@ function execVm(ops, nWords, op, S) {
         sOff = S.pgOff[a3]; sLen = S.pgLen[a3];
       }
       if (sLen > 0) {
-        if (op + sLen + 64 > dstCap) { dst = ensureOutSlab(op + sLen + 64, op); dstCap = dst.length; }
+        if (op + sLen + 64 > slCap) { sl = ensureSlab(op + sLen + 64, op); slCap = sl.length; }
         if (sLen <= 40) {
           const end = sOff + sLen;
-          for (let k = sOff; k < end; k++) dst[op++] = h[k];
+          for (let k = sOff; k < end; k++) sl[op++] = sl[k];
         } else {
-          h.copy(dst, op, sOff, sOff + sLen);
+          sl.copyWithin(op, sOff, sOff + sLen);
           op += sLen;
         }
       }
@@ -882,15 +1043,16 @@ function execVm(ops, nWords, op, S) {
       else if (a1 === 4) val = S.loopIdx[a2];
       else val = S.loopLen[a2];
       if (val >= 0) {
-        if (op + 16 > dstCap) { dst = ensureOutSlab(op + 64, op); dstCap = dst.length; }
+        if (op + 16 > slCap) { sl = ensureSlab(op + 64, op); slCap = sl.length; }
         if (val < 10) {
-          dst[op++] = 48 + val;
+          sl[op++] = 48 + val;
         } else if (val < 100) {
           const q = (val / 10) | 0;
-          dst[op++] = 48 + q;
-          dst[op++] = 48 + (val - q * 10);
+          sl[op++] = 48 + q;
+          sl[op++] = 48 + (val - q * 10);
         } else {
           op = writeOutUint(val, op);
+          sl = SLAB; slCap = sl.length;
         }
       }
     } else if (code === OP_BOOL) {
@@ -898,9 +1060,9 @@ function execVm(ops, nWords, op, S) {
       if (a1 === 0) bv = S.pIsPost[S.regVal[a2]] !== 0;
       else if (a1 === 1) bv = S.loopIdx[a2] === 1;
       else bv = S.loopIdx[a2] === S.loopLen[a2];
-      if (op + 8 > dstCap) { dst = ensureOutSlab(op + 64, op); dstCap = dst.length; }
-      if (bv) { dst[op++] = 116; dst[op++] = 114; dst[op++] = 117; dst[op++] = 101; }
-      else { dst[op++] = 102; dst[op++] = 97; dst[op++] = 108; dst[op++] = 115; dst[op++] = 101; }
+      if (op + 8 > slCap) { sl = ensureSlab(op + 64, op); slCap = sl.length; }
+      if (bv) { sl[op++] = 116; sl[op++] = 114; sl[op++] = 117; sl[op++] = 101; }
+      else { sl[op++] = 102; sl[op++] = 97; sl[op++] = 108; sl[op++] = 115; sl[op++] = 101; }
     } else if (code === OP_JMP) {
       ip = a1;
     } else if (code === OP_JCOND) {
@@ -966,14 +1128,13 @@ function execVm(ops, nWords, op, S) {
         const cid = S.pCid[pid];
         const cLen = S.cardLen[cid];
         if (cLen >= 0) {
-          if (op + cLen + 64 > dstCap) { dst = ensureOutSlab(op + cLen + 64, op); dstCap = dst.length; }
+          if (op + cLen + 64 > slCap) { sl = ensureSlab(op + cLen + 64, op); slCap = sl.length; }
           const off = S.cardOff[cid];
           if (cLen <= 40) {
-            const cb = CARD_SLAB;
             const end = off + cLen;
-            for (let k = off; k < end; k++) dst[op++] = cb[k];
+            for (let k = off; k < end; k++) sl[op++] = sl[k];
           } else {
-            CARD_SLAB.copy(dst, op, off, off + cLen);
+            sl.copyWithin(op, off, off + cLen);
             op += cLen;
           }
           pos++;
@@ -994,12 +1155,13 @@ function execVm(ops, nWords, op, S) {
       if (cid !== -1) {
         const cs = S.cardStartOp;
         const cLen = op - cs;
-        const need = S.cp + cLen;
-        const cb = need > CARD_SLAB.length ? ensureCardSlab(need, S.cp) : CARD_SLAB;
-        dst.copy(cb, S.cp, cs, op);
-        S.cardOff[cid] = S.cp;
-        S.cardLen[cid] = cLen;
-        S.cp = need;
+        const cp = S.cp;
+        if (cp + cLen <= S.cardLimit) {
+          sl.copyWithin(cp, cs, op);
+          S.cardOff[cid] = cp;
+          S.cardLen[cid] = cLen;
+          S.cp = cp + cLen;
+        }
         S.pendingCid = -1;
       }
       const pos = S.curArrPos[d] + 1;
@@ -1031,32 +1193,34 @@ function isValidDateBuf(buf, s, e) {
   return d <= md;
 }
 
-function parseQuotedFmBuf(buf, s, e) {
-  if (e - s < 2 || buf[e - 1] !== 34) return { error: 'a quoted string is not closed' };
+let FM_ERR_Q = '';
+function parseQuotedFmBuf(buf, bufB, s, e) {
+  if (e - s < 2 || buf[e - 1] !== 34) { FM_ERR_Q = 'a quoted string is not closed'; return null; }
   const innerS = s + 1;
   const innerE = e - 1;
   let hasSpecial = false;
   for (let i = innerS; i < innerE; i++) {
     if (buf[i] === 92 || buf[i] === 34) { hasSpecial = true; break; }
   }
-  if (!hasSpecial) return { value: buf.toString('utf8', innerS, innerE) };
+  if (!hasSpecial) return bufB.toString('utf8', innerS, innerE);
   let p = 0;
   const out = LINK_BUF.length < (innerE - innerS) ? ensureLinkBuf(innerE - innerS) : LINK_BUF;
   for (let i = innerS; i < innerE; i++) {
     const c = buf[i];
     if (c === 92) {
-      if (i + 1 >= innerE) return { error: 'a quoted string holds an escape other than \\" or \\\\' };
+      if (i + 1 >= innerE) { FM_ERR_Q = 'a quoted string holds an escape other than \\" or \\\\'; return null; }
       const n = buf[i + 1];
-      if (n !== 34 && n !== 92) return { error: 'a quoted string holds an escape other than \\" or \\\\' };
+      if (n !== 34 && n !== 92) { FM_ERR_Q = 'a quoted string holds an escape other than \\" or \\\\'; return null; }
       out[p++] = n;
       i++;
     } else if (c === 34) {
-      return { error: 'a quoted string holds a stray quote' };
+      FM_ERR_Q = 'a quoted string holds a stray quote';
+      return null;
     } else {
       out[p++] = c;
     }
   }
-  return { value: out.toString('utf8', 0, p) };
+  return LINK_BUF_B.toString('utf8', 0, p);
 }
 
 function fmBufEq(buf, s, e, lit) {
@@ -1067,13 +1231,16 @@ function fmBufEq(buf, s, e, lit) {
 }
 
 const KEY_NAMES = ['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary'];
+const FM_RES = { title: '', date: '', summary: '', layout: '', slug: '', draft: false, tags: null, err: '', bodyStart: 0 };
 
-function parseFrontMatterBuf(buf, basePos, endLimit) {
+function parseFrontMatterBuf(buf, bufB, basePos, endLimit) {
   const len = endLimit;
+  const fm = FM_RES;
   let nl = basePos;
   while (nl < len && buf[nl] !== 10) nl++;
   if (nl - basePos !== 3 || buf[basePos] !== 45 || buf[basePos + 1] !== 45 || buf[basePos + 2] !== 45) {
-    return { error: 'no front matter' };
+    fm.err = 'no front matter';
+    return false;
   }
   const bodyFmStart = nl + 1;
   let pos = bodyFmStart;
@@ -1089,9 +1256,9 @@ function parseFrontMatterBuf(buf, basePos, endLimit) {
     }
     pos = nl + 1;
   }
-  if (closePos === -1) return { error: 'the front matter is not closed' };
+  if (closePos === -1) { fm.err = 'the front matter is not closed'; return false; }
 
-  const data = { title: '', date: '', summary: '', layout: '', slug: '', draft: false, tags: null };
+  fm.title = ''; fm.date = ''; fm.summary = ''; fm.layout = ''; fm.slug = ''; fm.draft = false; fm.tags = null;
   let seenMask = 0;
   pos = bodyFmStart;
   let idx = 1;
@@ -1109,12 +1276,12 @@ function parseFrontMatterBuf(buf, basePos, endLimit) {
       for (let k = pos; k < lEnd; k++) {
         if (buf[k] === 58) { colon = k; break; }
       }
-      if (colon === -1 || colon === pos) return { error: `line ${idx + 1} is not "key: value"` };
+      if (colon === -1 || colon === pos) { fm.err = `line ${idx + 1} is not "key: value"`; return false; }
       for (let k = pos; k < colon; k++) {
         const b = buf[k];
-        if (!((b >= 97 && b <= 122) || b === 95)) return { error: `line ${idx + 1} is not "key: value"` };
+        if (!((b >= 97 && b <= 122) || b === 95)) { fm.err = `line ${idx + 1} is not "key: value"`; return false; }
       }
-      if (colon + 1 < lEnd && buf[colon + 1] !== 32) return { error: `line ${idx + 1} is not "key: value"` };
+      if (colon + 1 < lEnd && buf[colon + 1] !== 32) { fm.err = `line ${idx + 1} is not "key: value"`; return false; }
       let vs = colon + 2;
       let ve = lEnd;
       while (ve > vs && (buf[ve - 1] === 32 || buf[ve - 1] === 9)) ve--;
@@ -1129,69 +1296,71 @@ function parseFrontMatterBuf(buf, basePos, endLimit) {
       else if (kLen === 6 && k0 === 108 && fmBufEq(buf, pos, colon, 'layout')) kid = 4;
       else if (kLen === 4 && k0 === 115 && fmBufEq(buf, pos, colon, 'slug')) kid = 5;
       else if (kLen === 7 && k0 === 115 && fmBufEq(buf, pos, colon, 'summary')) kid = 6;
-      else return { error: `unknown key "${buf.toString('utf8', pos, colon)}"` };
+      else { fm.err = `unknown key "${bufB.toString('utf8', pos, colon)}"`; return false; }
 
       const bit = 1 << kid;
-      if ((seenMask & bit) !== 0) return { error: `key "${KEY_NAMES[kid]}" is given twice` };
+      if ((seenMask & bit) !== 0) { fm.err = `key "${KEY_NAMES[kid]}" is given twice`; return false; }
       seenMask |= bit;
-      if (vs >= ve) return { error: `key "${KEY_NAMES[kid]}" has no value` };
+      if (vs >= ve) { fm.err = `key "${KEY_NAMES[kid]}" has no value`; return false; }
 
       if (kid === 0 || kid === 6) {
         const b0 = buf[vs];
         let val;
         if (b0 === 34) {
-          const qr = parseQuotedFmBuf(buf, vs, ve);
-          if ('error' in qr) return { error: `key "${KEY_NAMES[kid]}": ${qr.error}` };
-          val = qr.value;
+          val = parseQuotedFmBuf(buf, bufB, vs, ve);
+          if (val === null) { fm.err = `key "${KEY_NAMES[kid]}": ${FM_ERR_Q}`; return false; }
         } else if (b0 === 91) {
-          return { error: `key "${KEY_NAMES[kid]}": a bare string opens on [` };
+          fm.err = `key "${KEY_NAMES[kid]}": a bare string opens on [`;
+          return false;
         } else {
-          val = buf.toString('utf8', vs, ve);
+          val = bufB.toString('utf8', vs, ve);
         }
-        if (kid === 0) data.title = val;
-        else data.summary = val;
+        if (kid === 0) fm.title = val;
+        else fm.summary = val;
       } else if (kid === 1) {
-        if (!isValidDateBuf(buf, vs, ve)) return { error: 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)' };
-        data.date = buf.toString('latin1', vs, ve);
+        if (!isValidDateBuf(buf, vs, ve)) { fm.err = 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)'; return false; }
+        fm.date = bufB.toString('latin1', vs, ve);
       } else if (kid === 3) {
-        if (fmBufEq(buf, vs, ve, 'true')) data.draft = true;
-        else if (fmBufEq(buf, vs, ve, 'false')) data.draft = false;
-        else return { error: 'key "draft": true or false' };
+        if (fmBufEq(buf, vs, ve, 'true')) fm.draft = true;
+        else if (fmBufEq(buf, vs, ve, 'false')) fm.draft = false;
+        else { fm.err = 'key "draft": true or false'; return false; }
       } else if (kid === 4) {
         for (let k = vs; k < ve; k++) {
           const c = buf[k];
-          if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 45)) return { error: 'key "layout": not a template name' };
+          if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 45)) { fm.err = 'key "layout": not a template name'; return false; }
         }
-        data.layout = buf.toString('latin1', vs, ve);
+        fm.layout = bufB.toString('latin1', vs, ve);
       } else if (kid === 5) {
-        if (ve - vs > SLUG_MAX || buf[vs] === 45 || buf[ve - 1] === 45) return { error: 'key "slug": not a slug' };
+        if (ve - vs > SLUG_MAX || buf[vs] === 45 || buf[ve - 1] === 45) { fm.err = 'key "slug": not a slug'; return false; }
         for (let k = vs; k < ve; k++) {
           const c = buf[k];
           const ok = (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || (c === 45 && buf[k - 1] !== 45);
-          if (!ok) return { error: 'key "slug": not a slug' };
+          if (!ok) { fm.err = 'key "slug": not a slug'; return false; }
         }
-        data.slug = buf.toString('latin1', vs, ve);
+        fm.slug = bufB.toString('latin1', vs, ve);
       } else {
-        if (buf[vs] !== 91 || buf[ve - 1] !== 93) return { error: 'key "tags": not a list [a, b]' };
-        const rawT = buf.toString('utf8', vs + 1, ve - 1);
-        if (rawT.trim() === '') data.tags = [];
+        if (buf[vs] !== 91 || buf[ve - 1] !== 93) { fm.err = 'key "tags": not a list [a, b]'; return false; }
+        const rawT = bufB.toString('utf8', vs + 1, ve - 1);
+        if (rawT.trim() === '') fm.tags = [];
         else {
           const tags = rawT.split(',').map((t) => t.trim());
           for (let ti = 0; ti < tags.length; ti++) {
             const tg = tags[ti];
             if (tg === '' || tg.includes('"') || tg.includes('[') || tg.includes(']')) {
-              return { error: 'key "tags": an empty tag, or one holding " [ or ]' };
+              fm.err = 'key "tags": an empty tag, or one holding " [ or ]';
+              return false;
             }
           }
-          data.tags = tags;
+          fm.tags = tags;
         }
       }
     }
     idx++;
     pos = lEnd + 1;
   }
-  if ((seenMask & 1) === 0) return { error: 'no title' };
-  return { data, bodyStart: bodyStart >= len ? len : bodyStart, bodyEnd: len, seenMask };
+  if ((seenMask & 1) === 0) { fm.err = 'no title'; return false; }
+  fm.bodyStart = bodyStart >= len ? len : bodyStart;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,12 +1462,12 @@ function appendTrimToPara(buf, s, e, pLen) {
   while (e > s && (buf[e - 1] === 32 || buf[e - 1] === 9)) e--;
   const n = e - s;
   if (n <= 0) return pLen;
-  const pb = ensureParaBuf(pLen + n + 2);
+  const pb = ensureParaBuf(pLen + n + 2, pLen);
   if (pLen > 0) pb[pLen++] = 10;
   if (n <= 40) {
     for (let k = s; k < e; k++) pb[pLen++] = buf[k];
   } else {
-    buf.copy(pb, pLen, s, e);
+    pb.set(buf.subarray(s, e), pLen);
     pLen += n;
   }
   return pLen;
@@ -1306,29 +1475,34 @@ function appendTrimToPara(buf, s, e, pLen) {
 
 function hCopyPre(pre, p) {
   const n = pre.length;
-  const dst = HBUF;
+  const dst = SLAB;
   for (let k = 0; k < n; k++) dst[p++] = pre[k];
   return p;
 }
 
+const MD_RES = { hp: 0, contentOff: 0, contentLen: 0, excerptOff: 0, excerptLen: 0 };
 const REUSABLE_HIDS = new Set();
 
-function renderMarkdownIntoHBuf(buf, bodyS, bodyE, hpStart, linkCtx, tocOut) {
+function renderMarkdownIntoHBuf(bodyLat, bodyBase, bodyS, bodyE, hpStart, linkCtx, tocOut) {
   REUSABLE_HIDS.clear();
   let p = hpStart;
-  const needBase = p + (bodyE - bodyS) * 8 + 262144;
-  if (needBase > HBUF.length) ensureHBuf(needBase, p);
+  const needBase = p + (bodyE - bodyS) * 10 + 262144;
+  if (needBase > SLAB.length) ensureSlab(needBase, p);
+  let sl = SLAB;
 
   let pos = bodyS;
   let exOff = 0, exLen = -1;
   const len = bodyE;
+  const blkTbl = BLK_START;
 
   while (pos <= len) {
-    if (pos === len && len > bodyS && buf[len - 1] === 10) break;
-    let nl = pos;
-    while (nl < len && buf[nl] !== 10) nl++;
+    if (pos === len && len > bodyS && sl[len - 1] === 10) break;
+    if (p + 65536 > sl.length) sl = ensureSlab(p + (len - pos) * 10 + 262144, p);
+    let rel = bodyLat.indexOf('\n', pos - bodyBase);
+    let nl = rel === -1 ? len : bodyBase + rel;
+    if (nl > len) nl = len;
     let lEnd = nl;
-    const c0 = pos < lEnd ? buf[pos] : -1;
+    const c0 = pos < lEnd ? sl[pos] : -1;
 
     if (c0 === -1) {
       if (pos >= len) break;
@@ -1336,37 +1510,39 @@ function renderMarkdownIntoHBuf(buf, bodyS, bodyE, hpStart, linkCtx, tocOut) {
       continue;
     }
 
-    if (c0 === 32 || c0 === 9 || c0 === 96 || c0 === 35 || c0 === 45 || c0 === 42 || c0 === 62 || (c0 >= 48 && c0 <= 57)) {
-      if ((c0 === 32 || c0 === 9) && bufIsBlank(buf, pos, lEnd)) {
+    if (blkTbl[c0] === 1) {
+      if ((c0 === 32 || c0 === 9) && bufIsBlank(sl, pos, lEnd)) {
         if (pos >= len) break;
         pos = nl + 1;
         continue;
       }
       if (c0 === 96) {
-        const langEnd = bufFenceOpen(buf, pos, lEnd);
+        const langEnd = bufFenceOpen(sl, pos, lEnd);
         if (langEnd !== -1) {
           p = hCopyPre(PRE_FENCE_O, p);
           if (langEnd > pos + 3) {
             p = hCopyPre(PRE_FENCE_LANG, p);
-            K_scanEsc(buf, pos + 3, langEnd, HBUF, p, HJ_LEN, HJ_FLAT);
+            K_scanEsc(sl, pos + 3, langEnd, sl, p, HJ_LEN, HJ_FLAT);
             p = SCAN_P[0];
-            HBUF[p++] = 92; HBUF[p++] = 34; // \"
+            sl[p++] = 92; sl[p++] = 34; // \"
           }
-          HBUF[p++] = 62; // >
+          sl[p++] = 62; // >
           pos = nl + 1;
           while (pos <= len) {
-            nl = pos;
-            while (nl < len && buf[nl] !== 10) nl++;
+            if (p + 65536 > sl.length) sl = ensureSlab(p + (len - pos) * 10 + 262144, p);
+            rel = bodyLat.indexOf('\n', pos - bodyBase);
+            nl = rel === -1 ? len : bodyBase + rel;
+            if (nl > len) nl = len;
             lEnd = nl;
-            if (bufFenceClose(buf, pos, lEnd)) {
+            if (bufFenceClose(sl, pos, lEnd)) {
               pos = nl + 1;
               break;
             }
             if (lEnd > pos) {
-              K_scanEsc(buf, pos, lEnd, HBUF, p, HJ_LEN, HJ_FLAT);
+              K_scanEsc(sl, pos, lEnd, sl, p, HJ_LEN, HJ_FLAT);
               p = SCAN_P[0];
             }
-            HBUF[p++] = 92; HBUF[p++] = 110; // \n
+            sl[p++] = 92; sl[p++] = 110; // \n
             if (pos >= len) { pos = len + 1; break; }
             pos = nl + 1;
           }
@@ -1374,21 +1550,20 @@ function renderMarkdownIntoHBuf(buf, bodyS, bodyE, hpStart, linkCtx, tocOut) {
           continue;
         }
       }
-      if (c0 === 35 && bufHeading(buf, pos, lEnd)) {
+      if (c0 === 35 && bufHeading(sl, pos, lEnd)) {
         const d = _bHd;
-        const id = uniqueSlug(slugifyBuf(buf, _bHs, _bHe), REUSABLE_HIDS);
-        const dst = HBUF;
-        dst[p++] = 60; dst[p++] = 104; dst[p++] = 48 + d;
-        dst[p++] = 32; dst[p++] = 105; dst[p++] = 100; dst[p++] = 61; dst[p++] = 92; dst[p++] = 34;
+        const id = uniqueSlug(slugifyBuf(sl, _bHs, _bHe, linkCtx.uCache), REUSABLE_HIDS);
+        sl[p++] = 60; sl[p++] = 104; sl[p++] = 48 + d;
+        sl[p++] = 32; sl[p++] = 105; sl[p++] = 100; sl[p++] = 61; sl[p++] = 92; sl[p++] = 34;
         const idOff = p;
-        for (let k = 0; k < id.length; k++) dst[p++] = id.charCodeAt(k);
+        for (let k = 0; k < id.length; k++) sl[p++] = id.charCodeAt(k);
         const idLen = p - idOff;
-        dst[p++] = 92; dst[p++] = 34; dst[p++] = 62;
+        sl[p++] = 92; sl[p++] = 34; sl[p++] = 62;
         const hInlStart = p;
-        p = mdInline(buf, _bHs, _bHe, p, linkCtx);
+        p = mdInline(sl, _bHs, _bHe, p, linkCtx);
+        sl = SLAB;
         const hInlLen = p - hInlStart;
-        const d2 = HBUF;
-        d2[p++] = 60; d2[p++] = 47; d2[p++] = 104; d2[p++] = 48 + d; d2[p++] = 62; d2[p++] = 92; d2[p++] = 110;
+        sl[p++] = 60; sl[p++] = 47; sl[p++] = 104; sl[p++] = 48 + d; sl[p++] = 62; sl[p++] = 92; sl[p++] = 110;
         if (d === 2 || d === 3) {
           const tid = tocOut.count;
           ensureTocCap(tid + 1);
@@ -1403,7 +1578,7 @@ function renderMarkdownIntoHBuf(buf, bodyS, bodyE, hpStart, linkCtx, tocOut) {
         pos = nl + 1;
         continue;
       }
-      if ((c0 === 45 || c0 === 42) && bufIsHr(buf, pos, lEnd)) {
+      if ((c0 === 45 || c0 === 42) && bufIsHr(sl, pos, lEnd)) {
         p = hCopyPre(PRE_HR, p);
         if (pos >= len) break;
         pos = nl + 1;
@@ -1412,14 +1587,15 @@ function renderMarkdownIntoHBuf(buf, bodyS, bodyE, hpStart, linkCtx, tocOut) {
       if (c0 === 62) {
         let qLen = 0;
         while (pos <= len) {
-          if (pos === len && len > bodyS && buf[len - 1] === 10) break;
-          nl = pos;
-          while (nl < len && buf[nl] !== 10) nl++;
+          if (pos === len && len > bodyS && sl[len - 1] === 10) break;
+          rel = bodyLat.indexOf('\n', pos - bodyBase);
+          nl = rel === -1 ? len : bodyBase + rel;
+          if (nl > len) nl = len;
           lEnd = nl;
-          if (pos >= lEnd || buf[pos] !== 62) break;
+          if (pos >= lEnd || sl[pos] !== 62) break;
           let ts = pos + 1;
-          if (ts < lEnd && buf[ts] === 32) ts++;
-          qLen = appendTrimToPara(buf, ts, lEnd, qLen);
+          if (ts < lEnd && sl[ts] === 32) ts++;
+          qLen = appendTrimToPara(sl, ts, lEnd, qLen);
           if (pos >= len) { pos = len + 1; break; }
           pos = nl + 1;
         }
@@ -1428,45 +1604,51 @@ function renderMarkdownIntoHBuf(buf, bodyS, bodyE, hpStart, linkCtx, tocOut) {
         } else {
           p = hCopyPre(PRE_BQ_O, p);
           p = mdInline(PARA_BUF, 0, qLen, p, linkCtx);
+          sl = SLAB;
           p = hCopyPre(PRE_BQ_C, p);
         }
         continue;
       }
-      const isUl = pos + 1 < lEnd && (c0 === 45 || c0 === 42) && buf[pos + 1] === 32;
-      const ordPay = isUl || c0 < 48 || c0 > 57 ? -1 : bufMatchOrd(buf, pos, lEnd);
+      const isUl = pos + 1 < lEnd && (c0 === 45 || c0 === 42) && sl[pos + 1] === 32;
+      const ordPay = isUl || c0 < 48 || c0 > 57 ? -1 : bufMatchOrd(sl, pos, lEnd);
       if (isUl || ordPay !== -1) {
         let startNum = 1;
         if (!isUl) {
           startNum = 0;
-          for (let k = pos; k < ordPay - 2; k++) startNum = startNum * 10 + (buf[k] - 48);
+          for (let k = pos; k < ordPay - 2; k++) startNum = startNum * 10 + (sl[k] - 48);
         }
         if (isUl) p = hCopyPre(PRE_UL_O, p);
         else if (startNum === 1) p = hCopyPre(PRE_OL_O1, p);
         else {
           const sOpen = `<ol start=\\"${startNum}\\">\\n`;
-          for (let k = 0; k < sOpen.length; k++) HBUF[p++] = sOpen.charCodeAt(k);
+          for (let k = 0; k < sOpen.length; k++) sl[p++] = sOpen.charCodeAt(k);
         }
         let itemLen = -1;
         while (pos <= len) {
-          if (pos === len && len > bodyS && buf[len - 1] === 10) break;
-          nl = pos;
-          while (nl < len && buf[nl] !== 10) nl++;
+          if (pos === len && len > bodyS && sl[len - 1] === 10) break;
+          rel = bodyLat.indexOf('\n', pos - bodyBase);
+          nl = rel === -1 ? len : bodyBase + rel;
+          if (nl > len) nl = len;
           lEnd = nl;
           let payS = -1;
           if (isUl) {
-            if (pos + 1 < lEnd && (buf[pos] === 45 || buf[pos] === 42) && buf[pos + 1] === 32) payS = pos + 2;
+            if (pos + 1 < lEnd && (sl[pos] === 45 || sl[pos] === 42) && sl[pos + 1] === 32) payS = pos + 2;
           } else {
-            payS = bufMatchOrd(buf, pos, lEnd);
+            payS = bufMatchOrd(sl, pos, lEnd);
           }
           if (payS !== -1) {
             if (itemLen !== -1) {
               p = hCopyPre(PRE_LI_O, p);
-              if (itemLen > 0) p = mdInline(PARA_BUF, 0, itemLen, p, linkCtx);
+              if (itemLen > 0) {
+                if (p + itemLen * 10 + 65536 > sl.length) sl = ensureSlab(p + itemLen * 10 + 262144, p);
+                p = mdInline(PARA_BUF, 0, itemLen, p, linkCtx);
+                sl = SLAB;
+              }
               p = hCopyPre(PRE_LI_C, p);
             }
-            itemLen = appendTrimToPara(buf, payS, lEnd, 0);
-          } else if (itemLen !== -1 && bufIsContinued(buf, pos, lEnd)) {
-            itemLen = appendTrimToPara(buf, pos, lEnd, itemLen);
+            itemLen = appendTrimToPara(sl, payS, lEnd, 0);
+          } else if (itemLen !== -1 && bufIsContinued(sl, pos, lEnd)) {
+            itemLen = appendTrimToPara(sl, pos, lEnd, itemLen);
           } else {
             break;
           }
@@ -1475,7 +1657,11 @@ function renderMarkdownIntoHBuf(buf, bodyS, bodyE, hpStart, linkCtx, tocOut) {
         }
         if (itemLen !== -1) {
           p = hCopyPre(PRE_LI_O, p);
-          if (itemLen > 0) p = mdInline(PARA_BUF, 0, itemLen, p, linkCtx);
+          if (itemLen > 0) {
+            if (p + itemLen * 10 + 65536 > sl.length) sl = ensureSlab(p + itemLen * 10 + 262144, p);
+            p = mdInline(PARA_BUF, 0, itemLen, p, linkCtx);
+            sl = SLAB;
+          }
           p = hCopyPre(PRE_LI_C, p);
         }
         p = hCopyPre(isUl ? PRE_UL_C : PRE_OL_C, p);
@@ -1486,19 +1672,20 @@ function renderMarkdownIntoHBuf(buf, bodyS, bodyE, hpStart, linkCtx, tocOut) {
     // Zero-Copy Paragraph!
     const paraStart = pos;
     let prevEnd = lEnd;
-    const last0 = lEnd > pos ? buf[lEnd - 1] : 0;
+    const last0 = lEnd > pos ? sl[lEnd - 1] : 0;
     let dirty = c0 === 32 || c0 === 9 || last0 === 32 || last0 === 9;
     pos = nl + 1;
 
     while (pos <= len) {
-      if (pos === len && len > bodyS && buf[len - 1] === 10) break;
-      nl = pos;
-      while (nl < len && buf[nl] !== 10) nl++;
+      if (pos === len && len > bodyS && sl[len - 1] === 10) break;
+      rel = bodyLat.indexOf('\n', pos - bodyBase);
+      nl = rel === -1 ? len : bodyBase + rel;
+      if (nl > len) nl = len;
       lEnd = nl;
-      if (bufEndsPara(buf, pos, lEnd)) break;
+      if (bufEndsPara(sl, pos, lEnd)) break;
       if (!dirty) {
-        const fc = buf[pos];
-        const lc = buf[lEnd - 1];
+        const fc = sl[pos];
+        const lc = sl[lEnd - 1];
         if (fc === 32 || fc === 9 || lc === 32 || lc === 9) dirty = true;
       }
       prevEnd = lEnd;
@@ -1506,31 +1693,32 @@ function renderMarkdownIntoHBuf(buf, bodyS, bodyE, hpStart, linkCtx, tocOut) {
       pos = nl + 1;
     }
 
-    const dstP = HBUF;
-    dstP[p++] = 60; dstP[p++] = 112; dstP[p++] = 62; // <p>
+    sl[p++] = 60; sl[p++] = 112; sl[p++] = 62; // <p>
     const inlStart = p;
     if (!dirty) {
-      p = mdInline(buf, paraStart, prevEnd, p, linkCtx);
+      p = mdInline(sl, paraStart, prevEnd, p, linkCtx);
+      sl = SLAB;
     } else {
       let pLen = 0;
       let p2 = paraStart;
       let firstLine = true;
       while (p2 <= prevEnd) {
-        let n2 = p2;
-        while (n2 < prevEnd && buf[n2] !== 10) n2++;
+        let rel2 = bodyLat.indexOf('\n', p2 - bodyBase);
+        let n2 = rel2 === -1 ? prevEnd : bodyBase + rel2;
+        if (n2 > prevEnd) n2 = prevEnd;
         const le2 = n2;
-        while (p2 < le2 && (buf[p2] === 32 || buf[p2] === 9)) p2++;
+        while (p2 < le2 && (sl[p2] === 32 || sl[p2] === 9)) p2++;
         let e2 = le2;
-        while (e2 > p2 && (buf[e2 - 1] === 32 || buf[e2 - 1] === 9)) e2--;
+        while (e2 > p2 && (sl[e2 - 1] === 32 || sl[e2 - 1] === 9)) e2--;
         const subN = e2 - p2;
-        const pb = ensureParaBuf(pLen + subN + 2);
+        const pb = ensureParaBuf(pLen + subN + 2, pLen);
         if (firstLine) firstLine = false;
         else pb[pLen++] = 10;
         if (subN > 0) {
           if (subN <= 40) {
-            for (let k = p2; k < e2; k++) pb[pLen++] = buf[k];
+            for (let k = p2; k < e2; k++) pb[pLen++] = sl[k];
           } else {
-            buf.copy(pb, pLen, p2, e2);
+            pb.set(sl.subarray(p2, e2), pLen);
             pLen += subN;
           }
         }
@@ -1538,22 +1726,20 @@ function renderMarkdownIntoHBuf(buf, bodyS, bodyE, hpStart, linkCtx, tocOut) {
         p2 = n2 + 1;
       }
       p = mdInline(PARA_BUF, 0, pLen, p, linkCtx);
+      sl = SLAB;
     }
     if (exLen === -1) {
       exOff = inlStart;
       exLen = p - inlStart;
     }
-    const dstE = HBUF;
-    dstE[p++] = 60; dstE[p++] = 47; dstE[p++] = 112; dstE[p++] = 62; dstE[p++] = 92; dstE[p++] = 110; // </p>\n
+    sl[p++] = 60; sl[p++] = 47; sl[p++] = 112; sl[p++] = 62; sl[p++] = 92; sl[p++] = 110; // </p>\n
   }
 
-  return {
-    hp: p,
-    contentOff: hpStart,
-    contentLen: p - hpStart,
-    excerptOff: exLen === -1 ? hpStart : exOff,
-    excerptLen: exLen === -1 ? 0 : exLen,
-  };
+  MD_RES.hp = p;
+  MD_RES.contentOff = hpStart;
+  MD_RES.contentLen = p - hpStart;
+  MD_RES.excerptOff = exLen === -1 ? hpStart : exOff;
+  MD_RES.excerptLen = exLen === -1 ? 0 : exLen;
 }
 
 // ---------------------------------------------------------------------------
@@ -1778,9 +1964,9 @@ function compileTemplateVm(nodes, tplKind, hpBox) {
   const storeChunkH = (rawTxt) => {
     const esc = escJsonStr(rawTxt);
     const maxB = esc.length * 3 + 16;
-    ensureHBuf(hpBox.hp + maxB, hpBox.hp);
+    ensureSlab(hpBox.hp + maxB, hpBox.hp);
     const off = hpBox.hp;
-    const len = HBUF.utf8Write(esc, off);
+    const len = SLAB_BUF.utf8Write(esc, off);
     hpBox.hp = off + len;
     return [off, len];
   };
@@ -2002,13 +2188,13 @@ function skipJsonVal(buf, lat, i, len) {
   return i;
 }
 
-function decodeJsonStrSpan(buf, lat, s, e) {
+function decodeJsonStrSpan(bufB, lat, s, e) {
   const esc = lat.indexOf('\\', s);
-  if (esc === -1 || esc >= e) return buf.toString('utf8', s, e);
-  return JSON.parse(buf.toString('utf8', s - 1, e + 1));
+  if (esc === -1 || esc >= e) return bufB.toString('utf8', s, e);
+  return JSON.parse(bufB.toString('utf8', s - 1, e + 1));
 }
 
-function parseFilesRaw(buf, lat, i, len) {
+function parseFilesRaw(buf, bufB, lat, i, len) {
   i = skipWs(buf, i, len); // '['
   i++;
   const files = [];
@@ -2032,7 +2218,7 @@ function parseFilesRaw(buf, lat, i, len) {
       if (kl === 4 && buf[ks] === 112 && buf[ks + 1] === 97 && buf[ks + 2] === 116 && buf[ks + 3] === 104) {
         const vs = i + 1;
         const ve = findStrEnd(lat, vs);
-        pathStr = decodeJsonStrSpan(buf, lat, vs, ve);
+        pathStr = decodeJsonStrSpan(bufB, lat, vs, ve);
         i = ve + 1;
       } else if (kl === 7 && buf[ks] === 99 && buf[ks + 1] === 111 && buf[ks + 2] === 110 && buf[ks + 3] === 116 && buf[ks + 4] === 101 && buf[ks + 5] === 110 && buf[ks + 6] === 116) {
         const vs = i + 1;
@@ -2048,7 +2234,7 @@ function parseFilesRaw(buf, lat, i, len) {
   return [files, i];
 }
 
-function parseInputObjRaw(buf, lat, i, len) {
+function parseInputObjRaw(buf, bufB, lat, i, len) {
   i = skipWs(buf, i, len); // '{'
   i++;
   let site = null, templates = null, files = null;
@@ -2058,17 +2244,17 @@ function parseInputObjRaw(buf, lat, i, len) {
     if (buf[i] === 44) { i++; i = skipWs(buf, i, len); }
     const ks = i + 1;
     const ke = findStrEnd(lat, ks);
-    const key = buf.toString('latin1', ks, ke);
+    const key = bufB.toString('latin1', ks, ke);
     i = skipWs(buf, ke + 1, len); // ':'
     i = skipWs(buf, i + 1, len);
     if (key === 'site' || key === 'templates') {
       const vs = i;
       const ve = skipJsonVal(buf, lat, vs, len);
-      const obj = JSON.parse(buf.toString('utf8', vs, ve));
+      const obj = JSON.parse(bufB.toString('utf8', vs, ve));
       if (key === 'site') site = obj; else templates = obj;
       i = ve;
     } else if (key === 'files') {
-      const res = parseFilesRaw(buf, lat, i, len);
+      const res = parseFilesRaw(buf, bufB, lat, i, len);
       files = res[0];
       i = res[1];
     } else {
@@ -2078,8 +2264,7 @@ function parseInputObjRaw(buf, lat, i, len) {
   return [{ site, templates, files }, i];
 }
 
-function parseCasesRaw(buf, lat) {
-  const len = buf.length;
+function parseCasesRaw(buf, bufB, lat, len) {
   let i = skipWs(buf, 0, len); // '['
   i++;
   const out = [];
@@ -2096,11 +2281,11 @@ function parseCasesRaw(buf, lat) {
       if (buf[i] === 44) { i++; i = skipWs(buf, i, len); }
       const ks = i + 1;
       const ke = findStrEnd(lat, ks);
-      const key = buf.toString('latin1', ks, ke);
+      const key = bufB.toString('latin1', ks, ke);
       i = skipWs(buf, ke + 1, len); // ':'
       i = skipWs(buf, i + 1, len);
       if (key === 'input') {
-        const res = parseInputObjRaw(buf, lat, i, len);
+        const res = parseInputObjRaw(buf, bufB, lat, i, len);
         inp = res[0];
         i = res[1];
       } else {
@@ -2131,21 +2316,127 @@ function resolveRelPathParts(dirParts, rel) {
 
 const dirOf = (p) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
 
-function buildSiteToOutSlab(inp, rawBuf, op) {
-  const S = VM_S;
-  const hpBox = { hp: 0 };
-  S.cp = 0;
+const OWN_TAG_SEEN = new Set();
 
-  const allocFieldH = (str) => {
-    if (str === '') return [0, 0];
-    const esc = escHtmlJsonStr(str);
-    const maxB = esc.length * 3 + 16;
-    ensureHBuf(hpBox.hp + maxB, hpBox.hp);
-    const off = hpBox.hp;
-    const len = HBUF.utf8Write(esc, off);
-    hpBox.hp = off + len;
-    return [off, len];
+function writeSlotFieldH(str, offArr, lenArr, slotIdx, hpBox) {
+  const n = str.length;
+  if (n === 0) {
+    offArr[slotIdx] = 0;
+    lenArr[slotIdx] = 0;
+    return;
+  }
+  const hp = hpBox.hp;
+  const maxB = n * 6 + 16;
+  const h = hp + maxB > SLAB.length ? ensureSlab(hp + maxB, hp) : SLAB;
+  const hj = HJ_LEN;
+  let asciiClean = true;
+  for (let i = 0; i < n; i++) {
+    const c = str.charCodeAt(i);
+    if (c >= 128 || hj[c] !== 0) { asciiClean = false; break; }
+    h[hp + i] = c;
+  }
+  if (asciiClean) {
+    offArr[slotIdx] = hp;
+    lenArr[slotIdx] = n;
+    hpBox.hp = hp + n;
+    return;
+  }
+  const esc = escHtmlJsonStr(str);
+  const escMax = esc.length * 3 + 16;
+  if (hp + escMax > SLAB.length) ensureSlab(hp + escMax, hp);
+  const len = SLAB_BUF.utf8Write(esc, hp);
+  offArr[slotIdx] = hp;
+  lenArr[slotIdx] = len;
+  hpBox.hp = hp + len;
+}
+
+function cachedSlug(name, slugCache, uCache) {
+  let sl = slugCache.get(name);
+  if (sl === undefined) { sl = slugifyStr(name, uCache); slugCache.set(name, sl); }
+  return sl;
+}
+
+function openKv(kStr, op, writtenKeys, sepByte) {
+  writtenKeys.add(kStr);
+  const kn = kStr.length;
+  const need = op + kn * 6 + 16;
+  const outB = need > SLAB.length ? ensureSlab(need, op) : SLAB;
+  outB[op++] = sepByte;
+  outB[op++] = 34;
+  let asciiFast = true;
+  for (let k = 0; k < kn; k++) {
+    const c = kStr.charCodeAt(k);
+    if (c < 32 || c > 126 || c === 34 || c === 92) { asciiFast = false; break; }
+    outB[op + k] = c;
+  }
+  if (asciiFast) {
+    op += kn;
+  } else {
+    op = writeOutEscJsonStr(kStr, op);
+  }
+  if (op + 4 > SLAB.length) ensureSlab(op + 4, op);
+  SLAB[op++] = 34; SLAB[op++] = 58; SLAB[op++] = 34; // ":"
+  return op;
+}
+
+function closeKv(op) {
+  const dst = op + 4 > SLAB.length ? ensureSlab(op + 4, op) : SLAB;
+  dst[op++] = 34;
+  return op;
+}
+
+function decodeHPlain(off, len) {
+  if (len <= 0) return '';
+  const s = SLAB_BUF.toString('utf8', off, off + len);
+  return s.indexOf('\\') === -1 ? s : JSON.parse('"' + s + '"');
+}
+
+function makeDynCard(it, S) {
+  const pb = it.pid * PF_STRIDE;
+  return {
+    title: it.title, url: it.url, date: it.date, date_long: it.dateLong,
+    summary: it.summary, excerpt: decodeHPlain(S.pOff[pb + 6], S.pLen[pb + 6]),
+    reading_minutes: S.pReadMin[it.pid],
+    tags: it.tObjs.map((t) => t.posts !== null ? { name: t.name, slug: t.slug, url: t.url, count: t.posts.length } : { name: t.name, slug: t.slug, url: '' }),
   };
+}
+
+function makeDynPage(it, kept, S) {
+  const baseCard = makeDynCard(it, S);
+  const pb = it.pid * PF_STRIDE;
+  const tS = S.pTocStart[it.pid], tC = S.pTocCount[it.pid];
+  const toc = new Array(tC);
+  for (let k = 0; k < tC; k++) {
+    const tid = tS + k;
+    toc[k] = { level: S.tocLevel[tid], id: SLAB_BUF.toString('latin1', S.tocIdOff[tid], S.tocIdOff[tid] + S.tocIdLen[tid]), html: decodeHPlain(S.tocHtmlOff[tid], S.tocHtmlLen[tid]) };
+  }
+  return {
+    ...baseCard,
+    slug: it.slug,
+    content: decodeHPlain(S.pOff[pb + 7], S.pLen[pb + 7]),
+    is_post: it.post,
+    toc,
+    newer: it.newerPid === -1 ? null : { title: kept[it.newerPid].title, url: kept[it.newerPid].url, date: kept[it.newerPid].date, date_long: kept[it.newerPid].dateLong },
+    older: it.olderPid === -1 ? null : { title: kept[it.olderPid].title, url: kept[it.olderPid].url, date: kept[it.olderPid].date, date_long: kept[it.olderPid].dateLong },
+  };
+}
+
+function getCompiledTpl(name, kind, rawTpls, compiledTpls, siteScope, hpBox) {
+  const ck = name + ':' + kind;
+  let c = compiledTpls.get(ck);
+  if (c === undefined) {
+    const raw = rawTpls.get(name);
+    if (raw === undefined) { compiledTpls.set(ck, null); return null; }
+    const inlined = inlineAstIncludes(raw, rawTpls, 0);
+    const folded = foldInvariantNodes(inlined, siteScope);
+    c = compileTemplateVm(folded, kind, hpBox);
+    compiledTpls.set(ck, c);
+  }
+  return c;
+}
+
+function buildSiteToOutSlab(inp, rawLen, rawLat, hasAnyU, prefixByte, isLast, outRange) {
+  const S = VM_S;
 
   const rawTpls = new Map();
   const report = [];
@@ -2174,92 +2465,161 @@ function buildSiteToOutSlab(inp, rawBuf, op) {
   const base = inp.site.base_url.replace(/\/+$/, '');
   const siteVar = { title: inp.site.title, base_url: base };
 
-  // Decode raw JSON string span of a .md file into MD_BUF once, parse frontmatter, save body coords!
+  const bodyBase = rawLen;
+  let sumMdRaw = 0;
+  if (rawLen > 0) {
+    for (let i = 0; i < mdSources.length; i++) sumMdRaw += mdSources[i].rawE - mdSources[i].rawS;
+  } else {
+    for (let i = 0; i < mdSources.length; i++) sumMdRaw += mdSources[i].jsContent.length * 3 + 16;
+  }
+  ensureSlab(bodyBase + sumMdRaw + 65536, bodyBase);
+
   const kept = [];
   const bySource = new Map();
   const takenMap = new Map();
   const slugCache = new Map();
-  const cachedSlug = (name) => {
-    let sl = slugCache.get(name);
-    if (sl === undefined) { sl = slugifyStr(name); slugCache.set(name, sl); }
-    return sl;
-  };
+  const uCache = new Map();
+  const fm = FM_RES;
+  let bp = bodyBase;
+  const fmFirst = rawLen > 0 && !hasAnyU;
 
-  let bp = 0;
-
-  // Pass 1: Unescape each .md ONCE into BODY_SLAB; validate frontmatter; retain body span for kept files!
+  // Pass 1: Frontmatter-first skip for drafts/refused when !hasAnyU; unescape body once into SLAB.
   for (let i = 0; i < mdSources.length; i++) {
     const src = mdSources[i];
-    const fileStart = bp;
-    let mdLen;
-    if (rawBuf !== null) {
-      const spanLen = src.rawE - src.rawS;
-      const bs = ensureBodySlab(fileStart + spanLen + 16, fileStart);
-      mdLen = K_unescMd(rawBuf, src.rawS, src.rawE, bs, fileStart, UNESC_TBL);
-      if (mdLen === -1) {
-        const sNorm = JSON.parse(rawBuf.toString('utf8', src.rawS - 1, src.rawE + 1)).replace(/\r\n?/g, '\n');
-        const bNeed = Buffer.byteLength(sNorm, 'utf8') + 16;
-        mdLen = ensureBodySlab(fileStart + bNeed, fileStart).utf8Write(sNorm, fileStart);
-      }
-    } else {
-      const sNorm = src.jsContent.indexOf('\r') === -1 ? src.jsContent : src.jsContent.replace(/\r\n?/g, '\n');
-      const bNeed = Buffer.byteLength(sNorm, 'utf8') + 16;
-      mdLen = ensureBodySlab(fileStart + bNeed, fileStart).utf8Write(sNorm, fileStart);
-    }
-
-    const fileEnd = fileStart + mdLen;
-    const fm = parseFrontMatterBuf(BODY_SLAB, fileStart, fileEnd);
-    if ('error' in fm) {
-      report.push(`refused ${src.path}: ${fm.error}`);
-      continue;
-    }
     const post = src.path.startsWith('posts/');
     let ownReserved = null;
     if (!post) {
       if (src.path.startsWith('tags/')) ownReserved = 'tags';
       else if (src.path.startsWith('page/')) ownReserved = 'page';
     }
-    if (ownReserved !== null) {
-      report.push(`refused ${src.path}: ${ownReserved}/ is the generator's own`);
-      continue;
+    const fileStart = bp;
+    let bodyStart = fileStart;
+    let fileEnd = fileStart;
+    let usedFmFirst = false;
+
+    if (fmFirst) {
+      const fmRawEnd = findRawFmEnd(SLAB, rawLat, src.rawS, src.rawE);
+      if (fmRawEnd === -2) {
+        report.push(`refused ${src.path}: no front matter`);
+        continue;
+      }
+      if (fmRawEnd === -3) {
+        report.push(`refused ${src.path}: the front matter is not closed`);
+        continue;
+      }
+      const rawFmLen = fmRawEnd - src.rawS;
+      const fmDst = rawFmLen + 16 > FM_BUF.length ? ensureFmBuf(rawFmLen + 16) : FM_BUF;
+      const fmLen = unescSmall(SLAB, src.rawS, fmRawEnd, fmDst, UNESC_TBL);
+      if (fmLen !== -1) {
+        usedFmFirst = true;
+        if (!parseFrontMatterBuf(fmDst, FM_BUF_B, 0, fmLen)) {
+          report.push(`refused ${src.path}: ${fm.err}`);
+          continue;
+        }
+        if (ownReserved !== null) {
+          report.push(`refused ${src.path}: ${ownReserved}/ is the generator's own`);
+          continue;
+        }
+        if (post && fm.date === '') {
+          report.push(`refused ${src.path}: a post needs a date`);
+          continue;
+        }
+        const layout = fm.layout !== '' ? fm.layout : (post ? 'post' : 'page');
+        if (!rawTpls.has(layout)) {
+          report.push(`refused ${src.path}: layout "${layout}" is no template that parses`);
+          continue;
+        }
+        if (fm.draft === true) {
+          report.push(`draft ${src.path}`);
+          continue;
+        }
+        const bodyRawS = FM_RAW_BODY_S;
+        const bodySpan = src.rawE - bodyRawS;
+        if (fileStart + bodySpan + 16 > SLAB.length) ensureSlab(fileStart + bodySpan + 16, fileStart);
+        let mdBodyLen = bodySpan > 0 ? K_unescIdxOfCW(SLAB, rawLat, bodyRawS, src.rawE, fileStart, UNESC_TBL) : 0;
+        if (mdBodyLen === -1) {
+          const bNorm = JSON.parse('"' + SLAB_BUF.toString('utf8', bodyRawS, src.rawE) + '"').replace(/\r\n?/g, '\n');
+          const bNeed = Buffer.byteLength(bNorm, 'utf8') + 16;
+          if (fileStart + bNeed > SLAB.length) ensureSlab(fileStart + bNeed, fileStart);
+          mdBodyLen = SLAB_BUF.utf8Write(bNorm, fileStart);
+        }
+        bodyStart = fileStart;
+        fileEnd = fileStart + mdBodyLen;
+      }
     }
-    if (post && fm.data.date === '') {
-      report.push(`refused ${src.path}: a post needs a date`);
-      continue;
-    }
-    const layout = fm.data.layout !== '' ? fm.data.layout : (post ? 'post' : 'page');
-    if (!rawTpls.has(layout)) {
-      report.push(`refused ${src.path}: layout "${layout}" is no template that parses`);
-      continue;
-    }
-    if (fm.data.draft === true) {
-      report.push(`draft ${src.path}`);
-      continue;
+
+    if (!usedFmFirst) {
+      let mdLen;
+      if (rawLen > 0) {
+        const spanLen = src.rawE - src.rawS;
+        if (fileStart + spanLen + 16 > SLAB.length) ensureSlab(fileStart + spanLen + 16, fileStart);
+        mdLen = K_unescIdxOfCW(SLAB, rawLat, src.rawS, src.rawE, fileStart, UNESC_TBL);
+        if (mdLen === -1) {
+          const sNorm = JSON.parse(SLAB_BUF.toString('utf8', src.rawS - 1, src.rawE + 1)).replace(/\r\n?/g, '\n');
+          const bNeed = Buffer.byteLength(sNorm, 'utf8') + 16;
+          if (fileStart + bNeed > SLAB.length) ensureSlab(fileStart + bNeed, fileStart);
+          mdLen = SLAB_BUF.utf8Write(sNorm, fileStart);
+        }
+      } else {
+        const sNorm = src.jsContent.indexOf('\r') === -1 ? src.jsContent : src.jsContent.replace(/\r\n?/g, '\n');
+        const bNeed = Buffer.byteLength(sNorm, 'utf8') + 16;
+        if (fileStart + bNeed > SLAB.length) ensureSlab(fileStart + bNeed, fileStart);
+        mdLen = SLAB_BUF.utf8Write(sNorm, fileStart);
+      }
+      fileEnd = fileStart + mdLen;
+      if (!parseFrontMatterBuf(SLAB, SLAB_BUF, fileStart, fileEnd)) {
+        report.push(`refused ${src.path}: ${fm.err}`);
+        continue;
+      }
+      if (ownReserved !== null) {
+        report.push(`refused ${src.path}: ${ownReserved}/ is the generator's own`);
+        continue;
+      }
+      if (post && fm.date === '') {
+        report.push(`refused ${src.path}: a post needs a date`);
+        continue;
+      }
+      const layCheck = fm.layout !== '' ? fm.layout : (post ? 'post' : 'page');
+      if (!rawTpls.has(layCheck)) {
+        report.push(`refused ${src.path}: layout "${layCheck}" is no template that parses`);
+        continue;
+      }
+      if (fm.draft === true) {
+        report.push(`draft ${src.path}`);
+        continue;
+      }
+      bodyStart = fm.bodyStart;
     }
 
     bp = fileEnd;
+    const layout = fm.layout !== '' ? fm.layout : (post ? 'post' : 'page');
     const dir = post ? 'posts' : dirOf(src.path);
     let tSet = takenMap.get(dir);
     if (tSet === undefined) {
       tSet = new Set(dir === '' ? RESERVED : undefined);
       takenMap.set(dir, tSet);
     }
-    const slug = uniqueSlug(fm.data.slug !== '' ? fm.data.slug : slugifyStr(fm.data.title), tSet);
+    const slug = uniqueSlug(fm.slug !== '' ? fm.slug : slugifyStr(fm.title, uCache), tSet);
     const outDir = dir === '' ? slug : `${dir}/${slug}`;
     const url = `${base}/${outDir}/`;
     const item = {
       pid: kept.length,
-      src,
-      data: fm.data,
+      srcPath: src.path,
+      title: fm.title,
+      date: fm.date,
+      summary: fm.summary,
+      tags: fm.tags,
       post,
       layout,
       slug,
       outDir,
       url,
+      dateLong: '',
       newerPid: -1,
       olderPid: -1,
-      bodyStart: fm.bodyStart,
+      bodyStart,
       bodyEnd: fileEnd,
+      tObjs: null,
     };
     kept.push(item);
     bySource.set(src.path, item);
@@ -2269,53 +2629,71 @@ function buildSiteToOutSlab(inp, rawBuf, op) {
   const staticSet = new Set();
   for (let i = 0; i < statics.length; i++) staticSet.add(statics[i].path);
 
+  const bodyEnd = bp;
+  const bodyLat = bodyEnd > bodyBase ? SLAB_BUF.toString('latin1', bodyBase, bodyEnd) : '';
+  const hpBox = { hp: bodyEnd };
+
+  // Pre-write every kept page's URL first so writeResolvedHref can copyWithin U8 bytes directly!
+  for (let i = 0; i < kept.length; i++) {
+    const it = kept[i];
+    writeSlotFieldH(it.url, S.pOff, S.pLen, it.pid * PF_STRIDE + 1, hpBox);
+  }
+
   const broken = new Set();
   const dirPartsCache = new Map();
-  const linkCtx = { warm: 0, dirParts: [], bySource, staticSet, broken, base, srcPath: '' };
+  const linkCtx = { dir: '', upPrefix: [''], dirParts: [], bySource, staticSet, broken, base, srcPath: '', uCache };
   const tocOut = { count: 0 };
+  const mdr = MD_RES;
 
-  // Pass 2: Render Markdown directly from BODY_SLAB into HBUF & count words in one pass!
+  // Pass 2: Render Markdown directly from SLAB into SLAB, count words & encode page fields!
   for (let i = 0; i < kept.length; i++) {
     const it = kept[i];
     const pid = it.pid;
-    const src = it.src;
-    const dir = dirOf(src.path);
-    let dirParts = dirPartsCache.get(dir);
-    if (dirParts === undefined) {
-      dirParts = dir === '' ? [] : dir.split('/');
-      dirPartsCache.set(dir, dirParts);
+    const sp = it.srcPath;
+    const dir = dirOf(sp);
+    let dirMeta = dirPartsCache.get(dir);
+    if (dirMeta === undefined) {
+      const dirParts = dir === '' ? [] : dir.split('/');
+      const upPrefix = new Array(dirParts.length + 1);
+      upPrefix[0] = dir === '' ? '' : dir + '/';
+      for (let k = 1; k <= dirParts.length; k++) {
+        upPrefix[k] = k === dirParts.length ? '' : dirParts.slice(0, dirParts.length - k).join('/') + '/';
+      }
+      dirMeta = { dirParts, upPrefix };
+      dirPartsCache.set(dir, dirMeta);
     }
-    linkCtx.dirParts = dirParts;
-    linkCtx.srcPath = src.path;
+    linkCtx.dir = dir;
+    linkCtx.dirParts = dirMeta.dirParts;
+    linkCtx.upPrefix = dirMeta.upPrefix;
+    linkCtx.srcPath = sp;
 
     const bS = it.bodyStart;
     const bE = it.bodyEnd;
     S.pTocStart[pid] = tocOut.count;
-    const mdRes = renderMarkdownIntoHBuf(BODY_SLAB, bS, bE, hpBox.hp, linkCtx, tocOut);
-    hpBox.hp = mdRes.hp;
+    renderMarkdownIntoHBuf(bodyLat, bodyBase, bS, bE, hpBox.hp, linkCtx, tocOut);
+    hpBox.hp = mdr.hp;
     S.pTocCount[pid] = tocOut.count - S.pTocStart[pid];
 
-    const words = K_wordsU8(BODY_SLAB, bS, bE, WS_TBL);
+    const words = K_words4(SLAB, bS, bE, W_CLS);
     S.pReadMin[pid] = Math.max(1, Math.ceil(words / 200));
     S.pIsPost[pid] = it.post ? 1 : 0;
 
     const pBase = pid * PF_STRIDE;
-    const d = it.data;
-    const [tO, tL] = allocFieldH(d.title); S.pOff[pBase] = tO; S.pLen[pBase] = tL;
-    const [uO, uL] = allocFieldH(it.url); S.pOff[pBase + 1] = uO; S.pLen[pBase + 1] = uL;
-    const [dO, dL] = allocFieldH(d.date); S.pOff[pBase + 2] = dO; S.pLen[pBase + 2] = dL;
-    const dl = d.date === '' ? '' : longDate(d.date);
-    const [dlO, dlL] = allocFieldH(dl); S.pOff[pBase + 3] = dlO; S.pLen[pBase + 3] = dlL;
-    const [sO, sL] = allocFieldH(d.summary); S.pOff[pBase + 4] = sO; S.pLen[pBase + 4] = sL;
-    const [slO, slL] = allocFieldH(it.slug); S.pOff[pBase + 5] = slO; S.pLen[pBase + 5] = slL;
-    S.pOff[pBase + 6] = mdRes.excerptOff; S.pLen[pBase + 6] = mdRes.excerptLen;
-    S.pOff[pBase + 7] = mdRes.contentOff; S.pLen[pBase + 7] = mdRes.contentLen;
+    writeSlotFieldH(it.title, S.pOff, S.pLen, pBase, hpBox);
+    writeSlotFieldH(it.date, S.pOff, S.pLen, pBase + 2, hpBox);
+    const dl = it.date === '' ? '' : longDate(it.date);
+    writeSlotFieldH(dl, S.pOff, S.pLen, pBase + 3, hpBox);
+    writeSlotFieldH(it.summary, S.pOff, S.pLen, pBase + 4, hpBox);
+    writeSlotFieldH(it.slug, S.pOff, S.pLen, pBase + 5, hpBox);
+    S.pOff[pBase + 6] = mdr.excerptOff; S.pLen[pBase + 6] = mdr.excerptLen;
+    S.pOff[pBase + 7] = mdr.contentOff; S.pLen[pBase + 7] = mdr.contentLen;
     it.dateLong = dl;
   }
 
-  // Posts sort, newer/older links
-  const posts = kept.filter((s) => s.post);
-  posts.sort((x, y) => byCodeUnits(y.data.date, x.data.date) || byCodeUnits(x.slug, y.slug));
+  // Posts sort & newer/older links
+  const posts = [];
+  for (let i = 0; i < kept.length; i++) if (kept[i].post) posts.push(kept[i]);
+  posts.sort((x, y) => byCodeUnits(y.date, x.date) || byCodeUnits(x.slug, y.slug));
   for (let k = 0; k < posts.length; k++) {
     const p = posts[k];
     S.postPids[k] = p.pid;
@@ -2328,38 +2706,33 @@ function buildSiteToOutSlab(inp, rawBuf, op) {
     S.pOlder[p.pid] = oPid;
   }
 
-  // Tags & page tags
+  // Tags & page tags (using shared OWN_TAG_SEEN to avoid per-page Set allocations)
   const byTagSlug = new Map();
-  const allTagsList = []; // includes post tags and missing-page tags!
+  const allTagsList = [];
   const missingTagMap = new Map();
-  const ownTags = (s) => {
-    const arr = s.data.tags;
-    if (arr === null || arr.length === 0) return [];
-    const seen = new Set();
-    const res = [];
-    for (let i = 0; i < arr.length; i++) {
-      const name = arr[i];
-      const sl = cachedSlug(name);
-      if (!seen.has(sl)) { seen.add(sl); res.push([name, sl]); }
-    }
-    return res;
-  };
 
   for (let i = 0; i < posts.length; i++) {
     const p = posts[i];
-    const ot = ownTags(p);
-    p.tids = new Array(ot.length);
-    for (let k = 0; k < ot.length; k++) {
-      const [name, sl] = ot[k];
+    const arr = p.tags;
+    if (arr === null || arr.length === 0) { p.tObjs = []; continue; }
+    OWN_TAG_SEEN.clear();
+    const list = [];
+    for (let k = 0; k < arr.length; k++) {
+      const name = arr[k];
+      const sl = cachedSlug(name, slugCache, uCache);
+      if (OWN_TAG_SEEN.has(sl)) continue;
+      OWN_TAG_SEEN.add(sl);
       let tObj = byTagSlug.get(sl);
       if (tObj === undefined) {
         tObj = { tid: -1, name, slug: sl, url: `${base}/tags/${sl}/`, posts: [] };
         byTagSlug.set(sl, tObj);
       }
       tObj.posts.push(p);
-      p.tids[k] = tObj;
+      list.push(tObj);
     }
+    p.tObjs = list;
   }
+
   const realTags = [...byTagSlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
   for (let i = 0; i < realTags.length; i++) {
     realTags[i].tid = allTagsList.length;
@@ -2367,24 +2740,29 @@ function buildSiteToOutSlab(inp, rawBuf, op) {
   }
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
-    if (!s.post) {
-      const ot = ownTags(s);
-      s.tids = new Array(ot.length);
-      for (let k = 0; k < ot.length; k++) {
-        const [name, sl] = ot[k];
-        let tObj = byTagSlug.get(sl);
+    if (s.post) continue;
+    const arr = s.tags;
+    if (arr === null || arr.length === 0) { s.tObjs = []; continue; }
+    OWN_TAG_SEEN.clear();
+    const list = [];
+    for (let k = 0; k < arr.length; k++) {
+      const name = arr[k];
+      const sl = cachedSlug(name, slugCache, uCache);
+      if (OWN_TAG_SEEN.has(sl)) continue;
+      OWN_TAG_SEEN.add(sl);
+      let tObj = byTagSlug.get(sl);
+      if (tObj === undefined) {
+        const ck = sl + '\0' + name;
+        tObj = missingTagMap.get(ck);
         if (tObj === undefined) {
-          const ck = sl + '\0' + name;
-          tObj = missingTagMap.get(ck);
-          if (tObj === undefined) {
-            tObj = { tid: allTagsList.length, name, slug: sl, url: '', posts: null };
-            missingTagMap.set(ck, tObj);
-            allTagsList.push(tObj);
-          }
+          tObj = { tid: allTagsList.length, name, slug: sl, url: '', posts: null };
+          missingTagMap.set(ck, tObj);
+          allTagsList.push(tObj);
         }
-        s.tids[k] = tObj;
       }
+      list.push(tObj);
     }
+    s.tObjs = list;
   }
 
   ensureTagCap(allTagsList.length + 1);
@@ -2392,9 +2770,9 @@ function buildSiteToOutSlab(inp, rawBuf, op) {
   for (let i = 0; i < allTagsList.length; i++) {
     const t = allTagsList[i];
     const tb = i * TF_STRIDE;
-    const [nO, nL] = allocFieldH(t.name); S.tOff[tb] = nO; S.tLen[tb] = nL;
-    const [sO, sL] = allocFieldH(t.slug); S.tOff[tb + 1] = sO; S.tLen[tb + 1] = sL;
-    const [uO, uL] = allocFieldH(t.url); S.tOff[tb + 2] = uO; S.tLen[tb + 2] = uL;
+    writeSlotFieldH(t.name, S.tOff, S.tLen, tb, hpBox);
+    writeSlotFieldH(t.slug, S.tOff, S.tLen, tb + 1, hpBox);
+    writeSlotFieldH(t.url, S.tOff, S.tLen, tb + 2, hpBox);
     if (t.posts !== null) {
       S.tCount[i] = t.posts.length;
       S.tPostStart[i] = tagPostCursor;
@@ -2413,135 +2791,88 @@ function buildSiteToOutSlab(inp, rawBuf, op) {
     const s = kept[i];
     const pid = s.pid;
     S.pTagStart[pid] = pageTagCursor;
-    S.pTagCount[pid] = s.tids.length;
-    ensureAllPageTagsCap(pageTagCursor + s.tids.length);
-    for (let k = 0; k < s.tids.length; k++) S.allPageTags[pageTagCursor++] = s.tids[k].tid;
+    S.pTagCount[pid] = s.tObjs.length;
+    ensureAllPageTagsCap(pageTagCursor + s.tObjs.length);
+    for (let k = 0; k < s.tObjs.length; k++) S.allPageTags[pageTagCursor++] = s.tObjs[k].tid;
   }
 
-  // Build lightweight siteScope for template folding (and lazy dynamic fallback only if needed)
-  const tagCardsDyn = realTags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
-  const decodeHPlain = (off, len) => {
-    if (len <= 0) return '';
-    const s = HBUF.toString('utf8', off, off + len);
-    return s.indexOf('\\') === -1 ? s : JSON.parse('"' + s + '"');
-  };
-  const makeDynCard = (it) => {
-    const pb = it.pid * PF_STRIDE;
-    return {
-      title: it.data.title, url: it.url, date: it.data.date, date_long: it.dateLong,
-      summary: it.data.summary, excerpt: decodeHPlain(S.pOff[pb + 6], S.pLen[pb + 6]),
-      reading_minutes: S.pReadMin[it.pid],
-      tags: it.tids.map((t) => t.posts !== null ? { name: t.name, slug: t.slug, url: t.url, count: t.posts.length } : { name: t.name, slug: t.slug, url: '' }),
-    };
-  };
-  const recentDyn = posts.slice(0, inp.site.recent).map(makeDynCard);
+  const tagCardsDyn = new Array(realTags.length);
+  for (let i = 0; i < realTags.length; i++) {
+    const t = realTags[i];
+    tagCardsDyn[i] = { name: t.name, slug: t.slug, url: t.url, count: t.posts.length };
+  }
+  const recLim = Math.min(inp.site.recent, posts.length);
+  const recentDyn = new Array(recLim);
+  for (let i = 0; i < recLim; i++) recentDyn[i] = makeDynCard(posts[i], S);
   const siteScope = { vars: { site: siteVar, tags: tagCardsDyn, recent: recentDyn }, parent: null };
 
+  // Pre-compile all needed templates BEFORE reserving pager scratch, card cache, and output region!
   const compiledTpls = new Map();
-  const getCompiled = (name, kind) => {
-    const ck = name + ':' + kind;
-    let c = compiledTpls.get(ck);
-    if (c === undefined) {
-      const raw = rawTpls.get(name);
-      if (raw === undefined) { compiledTpls.set(ck, null); return null; }
-      const inlined = inlineAstIncludes(raw, rawTpls, 0);
-      const folded = foldInvariantNodes(inlined, siteScope);
-      c = compileTemplateVm(folded, kind, hpBox);
-      compiledTpls.set(ck, c);
+  const pageTplByLayout = new Map();
+  for (let i = 0; i < kept.length; i++) {
+    const lay = kept[i].layout;
+    if (!pageTplByLayout.has(lay)) {
+      pageTplByLayout.set(lay, getCompiledTpl(lay, 'page', rawTpls, compiledTpls, siteScope, hpBox));
     }
-    return c;
-  };
+  }
+  const per = inp.site.per_page;
+  const pages = Math.max(1, Math.ceil(posts.length / per));
+  const indexComp = getCompiledTpl('index', 'index', rawTpls, compiledTpls, siteScope, hpBox);
+  const tagComp = getCompiledTpl('tag', 'tag', rawTpls, compiledTpls, siteScope, hpBox);
+  const tagsComp = getCompiledTpl('tags', 'tags', rawTpls, compiledTpls, siteScope, hpBox);
 
-  // Helper to emit JSON entry into OUT_SLAB
+  const pagerBase = hpBox.hp;
+  const pagerCap = Math.max(4096, base.length * 18 + 2048);
+  const pagerHpBox = { hp: pagerBase };
+  const pagerEnd = pagerBase + pagerCap;
+
+  const cardBase = pagerEnd;
+  const cardCap = Math.max(512 * 1024, posts.length * 1024);
+  S.cp = cardBase;
+  S.cardLimit = cardBase + cardCap;
+
+  const outBase = S.cardLimit + (prefixByte !== 0 ? 1 : 0);
+  ensureSlab(outBase + 4 * 1024 * 1024, cardBase);
+  if (prefixByte !== 0) SLAB[outBase - 1] = prefixByte;
+  let op = outBase;
+
   const writtenKeys = new Set();
-  let firstEntry = true;
-  const openKv = (kStr, curOp) => {
-    writtenKeys.add(kStr);
-    let p = curOp;
-    const kn = kStr.length;
-    const need = p + kn * 6 + 16;
-    if (need > OUT_SLAB.length) ensureOutSlab(need, p);
-    const outB = OUT_SLAB;
-    outB[p++] = firstEntry ? 123 : 44; // '{' or ','
-    firstEntry = false;
-    outB[p++] = 34;
-    let asciiFast = true;
-    for (let k = 0; k < kn; k++) {
-      const c = kStr.charCodeAt(k);
-      if (c < 32 || c > 126 || c === 34 || c === 92) { asciiFast = false; break; }
-      outB[p + k] = c;
-    }
-    if (asciiFast) {
-      p += kn;
-    } else {
-      p = writeOutEscJsonStr(kStr, p);
-    }
-    OUT_SLAB[p++] = 34; OUT_SLAB[p++] = 58; OUT_SLAB[p++] = 34; // ":"
-    return p;
-  };
-  const closeKv = (curOp) => {
-    if (curOp + 4 > OUT_SLAB.length) ensureOutSlab(curOp + 4, curOp);
-    OUT_SLAB[curOp++] = 34;
-    return curOp;
-  };
-
-  const makeDynPage = (it) => {
-    const baseCard = makeDynCard(it);
-    const pb = it.pid * PF_STRIDE;
-    const tS = S.pTocStart[it.pid], tC = S.pTocCount[it.pid];
-    const toc = new Array(tC);
-    for (let k = 0; k < tC; k++) {
-      const tid = tS + k;
-      toc[k] = { level: S.tocLevel[tid], id: HBUF.toString('latin1', S.tocIdOff[tid], S.tocIdOff[tid] + S.tocIdLen[tid]), html: decodeHPlain(S.tocHtmlOff[tid], S.tocHtmlLen[tid]) };
-    }
-    return {
-      ...baseCard,
-      slug: it.slug,
-      content: decodeHPlain(S.pOff[pb + 7], S.pLen[pb + 7]),
-      is_post: it.post,
-      toc,
-      newer: it.newerPid === -1 ? null : { title: kept[it.newerPid].data.title, url: kept[it.newerPid].url, date: kept[it.newerPid].data.date, date_long: kept[it.newerPid].dateLong },
-      older: it.olderPid === -1 ? null : { title: kept[it.olderPid].data.title, url: kept[it.olderPid].url, date: kept[it.olderPid].data.date, date_long: kept[it.olderPid].dateLong },
-    };
-  };
+  let sep = 123; // '{' on first entry, ',' afterwards
 
   // Render pages
   for (let i = 0; i < kept.length; i++) {
     const it = kept[i];
-    const comp = getCompiled(it.layout, 'page');
-    op = openKv(`${it.outDir}/index.html`, op);
+    const comp = pageTplByLayout.get(it.layout);
+    op = openKv(`${it.outDir}/index.html`, op, writtenKeys, sep); sep = 44;
     if (!comp.needsDynScope) {
       S.regVal[0] = it.pid;
       op = execVm(comp.ops, comp.nWords, op, S);
     } else {
-      const sc = { vars: { site: siteVar, tags: tagCardsDyn, recent: recentDyn, page: makeDynPage(it) }, parent: null };
+      const sc = { vars: { site: siteVar, tags: tagCardsDyn, recent: recentDyn, page: makeDynPage(it, kept, S) }, parent: null };
       op = writeOutEscJsonStr(renderDynamicPlain(comp.nodes, sc), op);
     }
     op = closeKv(op);
   }
 
   // Render index pages
-  const per = inp.site.per_page;
-  const pages = Math.max(1, Math.ceil(posts.length / per));
-  const indexUrl = (k) => (k === 1 ? `${base}/` : `${base}/page/${k}/`);
-  const indexComp = getCompiled('index', 'index');
   if (indexComp !== null) {
     for (let k = 1; k <= pages; k++) {
-      const url = indexUrl(k);
-      const nUrl = k === 1 ? '' : indexUrl(k - 1);
-      const oUrl = k === pages ? '' : indexUrl(k + 1);
+      const url = k === 1 ? `${base}/` : `${base}/page/${k}/`;
+      const nUrl = k === 1 ? '' : (k === 2 ? `${base}/` : `${base}/page/${k - 1}/`);
+      const oUrl = k === pages ? '' : `${base}/page/${k + 1}/`;
       const start = (k - 1) * per;
       const cnt = Math.max(0, Math.min(posts.length, k * per) - start);
-      op = openKv(k === 1 ? 'index.html' : `page/${k}/index.html`, op);
+      op = openKv(k === 1 ? 'index.html' : `page/${k}/index.html`, op, writtenKeys, sep); sep = 44;
       if (!indexComp.needsDynScope) {
-        const [uO, uL] = allocFieldH(url); S.pgOff[0] = uO; S.pgLen[0] = uL;
-        const [nO, nL] = allocFieldH(nUrl); S.pgOff[1] = nO; S.pgLen[1] = nL;
-        const [oO, oL] = allocFieldH(oUrl); S.pgOff[2] = oO; S.pgLen[2] = oL;
+        pagerHpBox.hp = pagerBase;
+        writeSlotFieldH(url, S.pgOff, S.pgLen, 0, pagerHpBox);
+        writeSlotFieldH(nUrl, S.pgOff, S.pgLen, 1, pagerHpBox);
+        writeSlotFieldH(oUrl, S.pgOff, S.pgLen, 2, pagerHpBox);
         S.pgNumber = k; S.pgTotal = pages;
         S.curPostStart = start; S.curPostLen = cnt;
         op = execVm(indexComp.ops, indexComp.nWords, op, S);
       } else {
-        const slPosts = posts.slice(start, start + cnt).map(makeDynCard);
+        const slPosts = posts.slice(start, start + cnt).map((p) => makeDynCard(p, S));
         const pager = { number: k, total: pages, url, newer_url: nUrl, older_url: oUrl };
         const sc = { vars: { site: siteVar, tags: tagCardsDyn, recent: recentDyn, posts: slPosts, pager }, parent: null };
         op = writeOutEscJsonStr(renderDynamicPlain(indexComp.nodes, sc), op);
@@ -2551,16 +2882,15 @@ function buildSiteToOutSlab(inp, rawBuf, op) {
   }
 
   // Render tag pages
-  const tagComp = getCompiled('tag', 'tag');
   if (tagComp !== null) {
     for (let i = 0; i < realTags.length; i++) {
       const tp = realTags[i];
-      op = openKv(`tags/${tp.slug}/index.html`, op);
+      op = openKv(`tags/${tp.slug}/index.html`, op, writtenKeys, sep); sep = 44;
       if (!tagComp.needsDynScope) {
         S.regVal[0] = tp.tid;
         op = execVm(tagComp.ops, tagComp.nWords, op, S);
       } else {
-        const tagVar = { name: tp.name, slug: tp.slug, url: tp.url, count: tp.posts.length, posts: tp.posts.map(makeDynCard) };
+        const tagVar = { name: tp.name, slug: tp.slug, url: tp.url, count: tp.posts.length, posts: tp.posts.map((p) => makeDynCard(p, S)) };
         const sc = { vars: { site: siteVar, tags: tagCardsDyn, recent: recentDyn, tag: tagVar }, parent: null };
         op = writeOutEscJsonStr(renderDynamicPlain(tagComp.nodes, sc), op);
       }
@@ -2569,9 +2899,8 @@ function buildSiteToOutSlab(inp, rawBuf, op) {
   }
 
   // Render tags index
-  const tagsComp = getCompiled('tags', 'tags');
   if (tagsComp !== null) {
-    op = openKv('tags/index.html', op);
+    op = openKv('tags/index.html', op, writtenKeys, sep); sep = 44;
     if (!tagsComp.needsDynScope) {
       op = execVm(tagsComp.ops, tagsComp.nWords, op, S);
     } else {
@@ -2580,7 +2909,7 @@ function buildSiteToOutSlab(inp, rawBuf, op) {
     op = closeKv(op);
   }
 
-  // Render static files (ZERO-COPY directly from rawBuf!)
+  // Render static files (ZERO-COPY inside SLAB!)
   for (let i = 0; i < statics.length; i++) {
     const f = statics[i];
     if (writtenKeys.has(f.path)) {
@@ -2588,11 +2917,11 @@ function buildSiteToOutSlab(inp, rawBuf, op) {
       continue;
     }
     if (f.path === 'build-report.txt') continue;
-    op = openKv(f.path, op);
-    if (rawBuf !== null) {
+    op = openKv(f.path, op, writtenKeys, sep); sep = 44;
+    if (rawLen > 0) {
       const rLen = f.rawE - f.rawS;
-      if (op + rLen + 16 > OUT_SLAB.length) ensureOutSlab(op + rLen + 16, op);
-      if (rLen > 0) rawBuf.copy(OUT_SLAB, op, f.rawS, f.rawE);
+      if (op + rLen + 16 > SLAB.length) ensureSlab(op + rLen + 16, op);
+      if (rLen > 0) SLAB.copyWithin(op, f.rawS, f.rawE);
       op += rLen;
     } else {
       op = writeOutEscJsonStr(f.jsContent, op);
@@ -2603,64 +2932,51 @@ function buildSiteToOutSlab(inp, rawBuf, op) {
   // Build report
   const rLines = [...report, ...broken].sort(byCodeUnits);
   rLines.push(`built ${kept.length - posts.length} pages, ${posts.length} posts, ${realTags.length} tags and ${statics.length} static files`);
-  op = openKv('build-report.txt', op);
+  op = openKv('build-report.txt', op, writtenKeys, sep);
   op = writeOutEscJsonStr(`${rLines.join('\n')}\n`, op);
   op = closeKv(op);
 
-  if (op + 4 > OUT_SLAB.length) ensureOutSlab(op + 4, op);
-  OUT_SLAB[op++] = 125; // '}'
-  return op;
+  if (op + 8 > SLAB.length) ensureSlab(op + 8, op);
+  SLAB[op++] = 125; // '}'
+  if (isLast) SLAB[op++] = 93; // ']'
+  outRange.start = prefixByte !== 0 ? outBase - 1 : outBase;
+  outRange.end = op;
 }
 
-// Pre-warm ONLY the 3 K_* byte kernels once at load (covering <=40B, >40B, escapes, syntax stops & UTF-8 -> 0 deopts).
-(function prewarmByteKernels() {
-  const sBuf = Buffer.from('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab\\n\\r\\n\\r\\t\\b\\f\\"\\\\\\/\\u');
-  const dBuf = Buffer.allocUnsafe(128);
-  const wBuf = Buffer.concat([
-    Buffer.from('  hello world\tfoo\nbar aaaa '),
-    Buffer.from([0xC2, 0xA0, 0xC3, 0xA9, 0xE2, 0x80, 0x83, 0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0x98, 0x80, 32, 120]),
-  ]);
-  const mdWarm = Buffer.from(
-    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa & < > " \' \n \t \r \x01 \\\\ \\* [l] `c` short end'
-  );
-  for (let i = 0; i < 150; i++) {
-    K_unescMd(sBuf, 0, sBuf.length, dBuf, 0, UNESC_TBL);
-    K_unescMd(sBuf, 0, sBuf.length, dBuf, 8, UNESC_TBL);
-    K_wordsU8(wBuf, 0, wBuf.length, WS_TBL);
-    let ki = 0;
-    while (ki < mdWarm.length) {
-      ki = K_scanEsc(mdWarm, ki, mdWarm.length, HBUF, 0, MD_LUT, HJ_FLAT);
-      if (ki < mdWarm.length) ki++;
-    }
-    K_scanEsc(mdWarm, 0, mdWarm.length, HBUF, 0, HJ_LEN, HJ_FLAT);
-  }
-})();
-
-function writeFdAll(fd, buf, len) {
+function writeFdAll(fd, buf, start, len) {
   let off = 0;
-  while (off < len) off += writeSync(fd, buf, off, len - off);
+  while (off < len) off += writeSync(fd, buf, start + off, len - off);
 }
+
+const OUT_RANGE = { start: 0, end: 0 };
 
 function runFile(inPath, outPath) {
-  const rawBuf = readFileSync(inPath);
-  const lat = rawBuf.toString('latin1');
-  const cases = parseCasesRaw(rawBuf, lat);
-  const fd = openSync(outPath, 'w');
-  let op = 0;
-  OUT_SLAB[op++] = 91; // '['
-  for (let i = 0; i < cases.length; i++) {
-    if (i > 0) OUT_SLAB[op++] = 44; // ','
-    op = buildSiteToOutSlab(cases[i], rawBuf, op);
-    cases[i] = null;
-    if (i < cases.length - 1 && op > 2 * 1024 * 1024) {
-      writeFdAll(fd, OUT_SLAB, op);
-      op = 0;
-    }
+  const fdIn = openSync(inPath, 'r');
+  const rawLen = fstatSync(fdIn).size;
+  ensureSlab(rawLen + 6 * 1024 * 1024, 0);
+  let rOff = 0;
+  while (rOff < rawLen) {
+    const n = readSync(fdIn, SLAB, rOff, rawLen - rOff, null);
+    if (n <= 0) break;
+    rOff += n;
   }
-  if (op + 4 > OUT_SLAB.length) ensureOutSlab(op + 4, op);
-  OUT_SLAB[op++] = 93; // ']'
-  writeFdAll(fd, OUT_SLAB, op);
-  closeSync(fd);
+  closeSync(fdIn);
+  const rawLat = SLAB_BUF.toString('latin1', 0, rawLen);
+  const hasAnyU = rawLat.indexOf('\\u') !== -1;
+  const cases = parseCasesRaw(SLAB, SLAB_BUF, rawLat, rawLen);
+  const fdOut = openSync(outPath, 'w');
+  if (cases.length === 0) {
+    SLAB[0] = 91; SLAB[1] = 93;
+    writeFdAll(fdOut, SLAB_BUF, 0, 2);
+    closeSync(fdOut);
+    return;
+  }
+  for (let i = 0; i < cases.length; i++) {
+    buildSiteToOutSlab(cases[i], rawLen, rawLat, hasAnyU, i === 0 ? 91 : 44, i === cases.length - 1, OUT_RANGE);
+    cases[i] = null;
+    writeFdAll(fdOut, SLAB_BUF, OUT_RANGE.start, OUT_RANGE.end - OUT_RANGE.start);
+  }
+  closeSync(fdOut);
 }
 
 function run(input) {
@@ -2670,8 +2986,8 @@ function run(input) {
     const f = rawFiles[i];
     files[i] = { path: f.path, rawS: 0, rawE: 0, isMd: f.path.endsWith('.md'), jsContent: f.content };
   }
-  const op = buildSiteToOutSlab({ site: input.site, templates: input.templates, files }, null, 0);
-  return JSON.parse(OUT_SLAB.toString('utf8', 0, op));
+  buildSiteToOutSlab({ site: input.site, templates: input.templates, files }, 0, '', false, 0, false, OUT_RANGE);
+  return JSON.parse(SLAB_BUF.toString('utf8', OUT_RANGE.start, OUT_RANGE.end));
 }
 
 module.exports = { runFile, run };
